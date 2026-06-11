@@ -24,26 +24,48 @@ LOCATION_LABEL = "作品集案例地形01"
 
 GLOBAL_NOISE_SCALE = 4.5
 GLOBAL_WIGGLE_INTENSITY = 0.08
+
+# 🌐 可选：仅当你本机需要走代理才能访问外网时填写，例如 "http://127.0.0.1:10808"。
+#    默认 None = 直连（使用系统默认网络设置）。绝大多数用户保持 None 即可。
+HTTP_PROXY = None
+# 联网请求超时（秒）。Macrostrat 偶尔较慢，给足时间，超时即转入离线兜底。
+REQUEST_TIMEOUT = 10.0
 # ============================================================
 
 API_BASE = "https://macrostrat.org/api/v2"
 ERROR_MESSAGE = None
-STATUS_INFO = {"msg": "", "science_track": "", "layer_count": 0, "age_details": ""}
+STATUS_INFO = {"msg": "", "science_track": "", "layer_count": 0, "age_details": "", "net_error": ""}
 
 def fetch_by_coordinates(lat, lng):
-    """【全自动管道】直接用数字坐标硬核刺探全球地质大数据库"""
+    """【全自动管道】用经纬度联网请求 Macrostrat 地表地质单元。
+
+    成功返回地表单元 dict；任何失败（无网络 / 超时 / 该坐标无数据）返回 None，
+    调用方会据此转入离线兜底。失败原因记录到 STATUS_INFO['net_error'] 便于排查。
+    """
     params = urllib.parse.urlencode({"lat": lat, "lng": lng, "response": "long"})
     url = f"{API_BASE}/geologic_units/map?{params}"
     try:
-        ctx = ssl._create_unverified_context()
-        proxy_handler = urllib.request.ProxyHandler({'http': 'http://127.0.0.1:10808', 'https': 'http://127.0.0.1:10808'})
-        opener = urllib.request.build_opener(proxy_handler)
+        # 默认走系统网络设置（直连）；仅当用户显式配置 HTTP_PROXY 时才挂代理。
+        handlers = []
+        if HTTP_PROXY:
+            handlers.append(urllib.request.ProxyHandler({"http": HTTP_PROXY, "https": HTTP_PROXY}))
+        else:
+            handlers.append(urllib.request.ProxyHandler({}))  # 显式忽略环境里的异常代理变量
+        # 正常情况下使用校验过的 TLS；个别系统证书缺失时降级为不校验，避免直接连不上。
+        try:
+            handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+        except Exception:
+            handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+        opener = urllib.request.build_opener(*handlers)
         req = urllib.request.Request(url, headers={"User-Agent": "GeoBlender/Ultimate"})
-        with opener.open(req, timeout=2.5) as resp:
+        with opener.open(req, timeout=REQUEST_TIMEOUT) as resp:
             data = json.loads(resp.read().decode())
             units = data.get("success", {}).get("data", [])
-            if units: return units[0]
-    except Exception: pass
+            if units:
+                return units[0]
+            STATUS_INFO["net_error"] = "联网成功，但该坐标在 Macrostrat 没有匹配的地表单元。"
+    except Exception as exc:
+        STATUS_INFO["net_error"] = f"联网失败：{type(exc).__name__}: {exc}"
     return None
 
 def scientific_inference_engine(raw_layer):
@@ -57,9 +79,10 @@ def scientific_inference_engine(raw_layer):
         t_age = float(raw_layer.get("t_age", 0.0))
         STATUS_INFO["msg"] = f"🌐 联网成功！成功抓取坐标 ({LATITUDE}, {LONGITUDE}) 的真实地表数据。"
     else:
-        # 离线或未匹配时的完美自适应科学兜底（根据坐标的大体范围模拟，或默认给高精层理）
+        # 离线或未匹配时的自适应兜底（默认给一套砂岩高精层理）。
         surf_name, surf_color, b_age, t_age = "sandstone", "#C77D55", 320.0, 250.0
-        STATUS_INFO["msg"] = f"🔌 离线保护激活！已转入本地高精参数化地质发生器。"
+        reason = STATUS_INFO.get("net_error") or "未获取到联网数据"
+        STATUS_INFO["msg"] = f"🔌 离线兜底已激活（{reason}），当前为默认砂岩参数，非该坐标真实地质。"
 
     age_span = max(0.1, b_age - t_age)
     STATUS_INFO["age_details"] = f"⏳ 原生岩性: {surf_name.upper()} | 寿命跨度: {age_span:.2f}Ma ({b_age}Ma - {t_age}Ma)"
@@ -192,7 +215,8 @@ def build_foolproof_engine():
     # ── 🛰️ 核心流程：读取控制台坐标 ➔ 联网刺探 ➔ 双重推理 ──
     raw_layer = fetch_by_coordinates(LATITUDE, LONGITUDE)
     chosen_layers = scientific_inference_engine(raw_layer)
-    
+    STATUS_INFO["layer_count"] = len(chosen_layers)
+
     obj = bpy.context.active_object
     if not obj or obj.type != "MESH":
         if "天池DEM2" in bpy.data.objects: 
@@ -275,10 +299,21 @@ def build_foolproof_engine():
         
     out = next((n for n in nodes if n.type == "OUTPUT_MATERIAL"), None) or nodes.new("ShaderNodeOutputMaterial")
     out.location = (350, 0); links.new(prev_socket, out.inputs["Surface"])
-    
-    for area in bpy.context.screen.areas:
-        if area.type == 'NODE_EDITOR':
-            ctx = bpy.context.copy(); ctx['area'] = area; bpy.ops.node.view_all(ctx); break
+
+    # 自动缩放节点编辑器视图。Blender 4.x 用 temp_override；
+    # 旧版回退到 2.9x 的 dict 覆盖写法。失败也不影响材质本身已经建好。
+    try:
+        screen = getattr(bpy.context, "screen", None)
+        for area in (screen.areas if screen else []):
+            if area.type == "NODE_EDITOR":
+                if hasattr(bpy.context, "temp_override"):
+                    with bpy.context.temp_override(area=area):
+                        bpy.ops.node.view_all()
+                else:
+                    ctx = bpy.context.copy(); ctx["area"] = area; bpy.ops.node.view_all(ctx)
+                break
+    except Exception:
+        pass
     return True
 
 def draw_success_popup(self, context):
