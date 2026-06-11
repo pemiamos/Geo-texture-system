@@ -24,45 +24,394 @@ LOCATION_LABEL = "作品集案例地形01"
 
 GLOBAL_NOISE_SCALE = 4.5
 GLOBAL_WIGGLE_INTENSITY = 0.08
+
+# 🌐 可选：仅当你本机需要走代理才能访问外网时填写，例如 "http://127.0.0.1:10808"。
+#    默认 None = 直连（使用系统默认网络设置）。绝大多数用户保持 None 即可。
+HTTP_PROXY = None
+# 联网请求超时（秒）。Macrostrat 偶尔较慢，给足时间，超时即转入离线兜底。
+REQUEST_TIMEOUT = 10.0
+
+# ──────────────── 数据源分级（思路：真实优先，推断兜底）────────────────
+# ① Macrostrat /units：北美等地有真实"命名地层柱"，命中即直接按真实层序/年龄/厚度建层。
+# ② Macrostrat /map：全球粗覆盖的地表单元，作为推理引擎的"种子"。
+#    可选 OneGeology 中国 1:100万 WMS：中国地表岩性比 Macrostrat 世界图细。
+#    ⚠️ 注意：该服务端在本机实测未稳定响应，端点/图层名需你自行用浏览器确认后填入，默认关闭。
+ONEGEOLOGY_WMS = None      # 例如 "http://onegeologychina.cgs.gov.cn:8080/.../wms"
+ONEGEOLOGY_LAYER = None    # GetCapabilities 里查到的可查询图层名
+# ③ CRUST1.0：1°×1° 全球地壳模型，给真实的"沉积层/结晶地壳"厚度（粗，公里级）。
+#    用法：去 https://igppweb.ucsd.edu/~gabi/crust1.html 下载并解压，把含 crust1.bnds
+#    的目录路径填到下面；填了才启用，用于给地块的"沉积盖层 vs 基底"比例沾一点真实。
+CRUST1_DIR = None
+# ④ 中国地质图离线 GeoJSON（最准的中国地表岩性来源）：把 1:20万/1:100万 公开版的面
+#    导出为 EPSG:4326(WGS84 经纬度) 的 GeoJSON，路径填这里；填了且坐标落在某要素内，
+#    就作为中国坐标的最高优先种子。CHINA_GEOMAP_FIELDS 配置从属性里取岩性/年代/名称的字段名。
+CHINA_GEOMAP_GEOJSON = None
+CHINA_GEOMAP_FIELDS = {
+    "lith": ["岩性", "lithology", "lith", "rock", "rock_type"],
+    "age": ["年代", "时代", "age", "period", "era"],
+    "name": ["地层", "代号", "unit_name", "name", "符号"],
+}
 # ============================================================
 
 API_BASE = "https://macrostrat.org/api/v2"
 ERROR_MESSAGE = None
-STATUS_INFO = {"msg": "", "science_track": "", "layer_count": 0, "age_details": ""}
+STATUS_INFO = {"msg": "", "science_track": "", "layer_count": 0, "age_details": "", "net_error": ""}
 
 def fetch_by_coordinates(lat, lng):
-    """【全自动管道】直接用数字坐标硬核刺探全球地质大数据库"""
+    """【全自动管道】用经纬度联网请求 Macrostrat 地表地质单元。
+
+    成功返回地表单元 dict；任何失败（无网络 / 超时 / 该坐标无数据）返回 None，
+    调用方会据此转入离线兜底。失败原因记录到 STATUS_INFO['net_error'] 便于排查。
+    """
     params = urllib.parse.urlencode({"lat": lat, "lng": lng, "response": "long"})
     url = f"{API_BASE}/geologic_units/map?{params}"
     try:
-        ctx = ssl._create_unverified_context()
-        proxy_handler = urllib.request.ProxyHandler({'http': 'http://127.0.0.1:10808', 'https': 'http://127.0.0.1:10808'})
-        opener = urllib.request.build_opener(proxy_handler)
+        # 默认走系统网络设置（直连）；仅当用户显式配置 HTTP_PROXY 时才挂代理。
+        handlers = []
+        if HTTP_PROXY:
+            handlers.append(urllib.request.ProxyHandler({"http": HTTP_PROXY, "https": HTTP_PROXY}))
+        else:
+            handlers.append(urllib.request.ProxyHandler({}))  # 显式忽略环境里的异常代理变量
+        # 正常情况下使用校验过的 TLS；个别系统证书缺失时降级为不校验，避免直接连不上。
+        try:
+            handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+        except Exception:
+            handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+        opener = urllib.request.build_opener(*handlers)
         req = urllib.request.Request(url, headers={"User-Agent": "GeoBlender/Ultimate"})
-        with opener.open(req, timeout=2.5) as resp:
+        with opener.open(req, timeout=REQUEST_TIMEOUT) as resp:
             data = json.loads(resp.read().decode())
             units = data.get("success", {}).get("data", [])
-            if units: return units[0]
-    except Exception: pass
+            if units:
+                return units[0]
+            STATUS_INFO["net_error"] = "联网成功，但该坐标在 Macrostrat 没有匹配的地表单元。"
+    except Exception as exc:
+        STATUS_INFO["net_error"] = f"联网失败：{type(exc).__name__}: {exc}"
     return None
+
+
+def _http_get(url, timeout=None):
+    """通用 GET，复用代理 / TLS 策略，返回原始字节；失败抛异常由调用方处理。"""
+    handlers = []
+    if HTTP_PROXY:
+        handlers.append(urllib.request.ProxyHandler({"http": HTTP_PROXY, "https": HTTP_PROXY}))
+    else:
+        handlers.append(urllib.request.ProxyHandler({}))
+    if url.lower().startswith("https"):
+        try:
+            handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+        except Exception:
+            handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+    opener = urllib.request.build_opener(*handlers)
+    req = urllib.request.Request(url, headers={"User-Agent": "GeoBlender/Ultimate"})
+    with opener.open(req, timeout=timeout or REQUEST_TIMEOUT) as resp:
+        return resp.read()
+
+
+# 岩性名 → 代表色（用于真实地层柱，因为 /units 不一定带 color）。
+_LITH_COLOR = {
+    "sandstone": "#C8A165", "sand": "#D8C18A", "shale": "#6B7B6B", "mudstone": "#7A7A6E",
+    "siltstone": "#B59E78", "claystone": "#7A7466", "clay": "#7A7466",
+    "limestone": "#8FB6C9", "dolomite": "#C9B79B", "carbonate": "#9FC0CF", "chalk": "#E6E6DA",
+    "conglomerate": "#A98B6B", "breccia": "#9C7E63", "coal": "#23211F", "evaporite": "#E2D7C0",
+    "basalt": "#46464E", "andesite": "#8A7A6A", "rhyolite": "#C9B6A0", "tuff": "#BDB29C",
+    "volcanic": "#6A5A55", "granite": "#D8B0A0", "granodiorite": "#CBA694", "gabbro": "#3E4248",
+    "diorite": "#9A8E84", "gneiss": "#B0A0B8", "schist": "#8C8C7A", "marble": "#E0E0E0",
+    "quartzite": "#D8D2C0", "slate": "#4A4F58", "phyllite": "#7C8070",
+}
+_CLASS_COLOR = {"sedimentary": "#B0A080", "igneous": "#6A5F5A", "metamorphic": "#8A8A92"}
+
+
+def _unit_color(unit):
+    """从 Macrostrat /units 的 lith 数组推一个代表色。"""
+    liths = unit.get("lith") or []
+    blob = " ".join((l.get("name", "") + " " + l.get("type", "")) for l in liths).lower()
+    for key, col in _LITH_COLOR.items():
+        if key in blob:
+            return col
+    for l in liths:
+        col = _CLASS_COLOR.get((l.get("class") or "").lower())
+        if col:
+            return col
+    return "#8A96A0"
+
+
+def fetch_macrostrat_units(lat, lng):
+    """① 拉取 Macrostrat 真实地层柱（/units）。无覆盖（如中国）会返回空列表。"""
+    params = urllib.parse.urlencode({"lat": lat, "lng": lng, "response": "long"})
+    url = f"{API_BASE}/units?{params}"
+    try:
+        data = json.loads(_http_get(url).decode())
+        return data.get("success", {}).get("data", []) or []
+    except Exception as exc:
+        STATUS_INFO["net_error"] = f"/units 请求失败：{type(exc).__name__}: {exc}"
+        return []
+
+
+def build_layers_from_units(units):
+    """把真实地层柱转成 [{name,color,bot,top}]。按 t_age 由新到老排序：
+    最年轻(地表)放在与模板 🔝 同一槽位(index 0)，与推断路径的纵向约定保持一致。
+    层厚优先用 max_thick，缺失时退化为年龄跨度，再退化为等分。"""
+    units = [u for u in units if u]
+    if not units:
+        return None
+    units.sort(key=lambda u: float(u.get("t_age") or 0.0))   # 年轻 → 老
+
+    def weight(u):
+        mt = float(u.get("max_thick") or 0.0)
+        if mt > 0:
+            return mt
+        span = abs(float(u.get("b_age") or 0.0) - float(u.get("t_age") or 0.0))
+        return span if span > 0 else 1.0
+
+    raw_w = [weight(u) for u in units]
+    total = sum(raw_w) or 1.0
+    layers, bot = [], 0.0
+    n = len(units)
+    for i, u in enumerate(units):
+        top = 0.999 if i == n - 1 else bot + raw_w[i] / total * 0.999
+        nm = u.get("unit_name") or u.get("Fm") or u.get("Gp") or "未命名单元"
+        liths = u.get("lith") or []
+        lith_txt = liths[0].get("name", "") if liths else ""
+        b_age, t_age = u.get("b_age"), u.get("t_age")
+        mark = "🔝" if i == 0 else ("🧱" if i == n - 1 else "📄")
+        label = f"[{LOCATION_LABEL}] {mark} {nm}"
+        if lith_txt:
+            label += f"·{lith_txt}"
+        if b_age is not None and t_age is not None:
+            label += f" ({t_age}-{b_age}Ma)"
+        layers.append({"name": label, "color": _unit_color(u), "bot": round(bot, 4), "top": round(min(top, 0.999), 4)})
+        bot = top
+    STATUS_INFO["msg"] = f"🌐 命中 Macrostrat 真实地层柱：{n} 个地层单元（坐标 {LATITUDE}, {LONGITUDE}）。"
+    STATUS_INFO["science_track"] = "🔬 数据来源：Macrostrat /units 真实命名地层序列（非推断）。"
+    ages = [float(u.get("b_age") or 0) for u in units] + [float(u.get("t_age") or 0) for u in units]
+    STATUS_INFO["age_details"] = f"⏳ 真实地层柱 {n} 层 | 年龄跨度 {min(ages):.1f}-{max(ages):.1f}Ma"
+    return layers
+
+
+def fetch_onegeology_seed(lat, lng):
+    """② 可选：OneGeology 中国 1:100万 WMS GetFeatureInfo → 返回 raw_layer 风格的种子。
+    端点/图层名需在 ONEGEOLOGY_WMS / ONEGEOLOGY_LAYER 配好；解析尽量宽松。"""
+    if not (ONEGEOLOGY_WMS and ONEGEOLOGY_LAYER):
+        return None
+    # 用一个极小的 bbox 包住目标点，请求 1x1 像素的 GetFeatureInfo（JSON 优先）。
+    d = 0.01
+    bbox = f"{lng - d},{lat - d},{lng + d},{lat + d}"
+    q = urllib.parse.urlencode({
+        "service": "WMS", "version": "1.1.1", "request": "GetFeatureInfo",
+        "layers": ONEGEOLOGY_LAYER, "query_layers": ONEGEOLOGY_LAYER,
+        "srs": "EPSG:4326", "bbox": bbox, "width": "3", "height": "3",
+        "x": "1", "y": "1", "info_format": "application/json",
+    })
+    try:
+        raw = _http_get(f"{ONEGEOLOGY_WMS}?{q}").decode("utf-8", "ignore")
+        props = {}
+        try:
+            feats = json.loads(raw).get("features") or []
+            if feats:
+                props = feats[0].get("properties", {}) or {}
+        except Exception:
+            return None
+        # 字段名各服务不一，挑常见的兜底取。
+        def pick(*keys):
+            for k in props:
+                if k.lower() in keys:
+                    return props[k]
+            return None
+        name = pick("lith", "lithology", "rock_type", "description", "rxml") or "rock"
+        return {"name": str(name), "lith": str(pick("lith", "lithology") or ""),
+                "color": pick("color") or "#8A96A0", "b_age": 200.0, "t_age": 0.0}
+    except Exception as exc:
+        STATUS_INFO["net_error"] = f"OneGeology 请求失败：{type(exc).__name__}: {exc}"
+        return None
+
+
+def read_crust1_profile(lat, lng):
+    """③ 可选：从本地 CRUST1.0 模型读该点真实的沉积层 / 结晶地壳总厚度（km）。
+    返回 (sediment_km, crust_km) 或 None。纯 Python，不依赖 numpy。"""
+    if not CRUST1_DIR:
+        return None
+    try:
+        path = os.path.join(CRUST1_DIR, "crust1.bnds")
+        from math import floor
+        lon = lng - 360 if lng > 180 else (lng + 360 if lng < -180 else lng)
+        ilat = int(floor(90.0 - lat)); ilon = int(floor(180.0 + lon))
+        ilat = min(179, max(0, ilat)); ilon = min(359, max(0, ilon))
+        target = ilat * 360 + ilon
+        with open(path, "r") as f:
+            for idx, line in enumerate(f):
+                if idx == target:
+                    b = [float(x) for x in line.split()]   # 9 个边界顶面高程(km)
+                    th = [abs(b[i] - b[i + 1]) for i in range(len(b) - 1)]
+                    # 顺序：water, ice, 3×sediment, 3×crust, (mantle)
+                    sediment = sum(th[2:5]) if len(th) >= 5 else 0.0
+                    crust = sum(th[5:8]) if len(th) >= 8 else 0.0
+                    return sediment, crust
+    except Exception as exc:
+        STATUS_INFO["net_error"] = f"CRUST1.0 读取失败：{type(exc).__name__}: {exc}"
+    return None
+
+
+def apply_crust1_cover_bias(layers, lat, lng):
+    """用 CRUST1.0 的沉积/地壳比，温和地调整地块"沉积盖层 vs 基底"的厚度占比。
+    沉积占比越大 → 顶部各层整体更厚、底部基底更薄；反之亦然。clamp 防止视觉崩坏。"""
+    prof = read_crust1_profile(lat, lng)
+    if not prof or len(layers) < 2:
+        return layers
+    sediment, crust = prof
+    denom = sediment + crust
+    if denom <= 0:
+        return layers
+    cover_frac = max(0.15, min(0.85, sediment / denom))   # 真实沉积占比，夹在 15%~85%
+    bodies, base = layers[:-1], layers[-1]                 # 最后一层视为基底
+    body_span = cover_frac * 0.999
+    bot, new = 0.0, []
+    spans = [(l["top"] - l["bot"]) for l in bodies]
+    tot = sum(spans) or 1.0
+    for l, s in zip(bodies, spans):
+        top = bot + s / tot * body_span
+        nl = dict(l); nl["bot"] = round(bot, 4); nl["top"] = round(top, 4); new.append(nl)
+        bot = top
+    nb = dict(base); nb["bot"] = round(bot, 4); nb["top"] = 0.999; new.append(nb)
+    STATUS_INFO["age_details"] += f" | CRUST1.0 沉积{sediment:.1f}km/地壳{crust:.1f}km→盖层占比{cover_frac:.0%}"
+    return new
+
+
+def _point_in_polygon(lng, lat, rings):
+    """射线法判断点是否在 GeoJSON Polygon 内（rings[0]=外环，其余=洞）。纯 Python。"""
+    def in_ring(ring):
+        inside = False
+        n = len(ring)
+        j = n - 1
+        for i in range(n):
+            xi, yi = ring[i][0], ring[i][1]
+            xj, yj = ring[j][0], ring[j][1]
+            if ((yi > lat) != (yj > lat)) and (lng < (xj - xi) * (lat - yi) / ((yj - yi) or 1e-12) + xi):
+                inside = not inside
+            j = i
+        return inside
+    if not rings:
+        return False
+    if not in_ring(rings[0]):
+        return False
+    return not any(in_ring(hole) for hole in rings[1:])   # 落在洞里则不算命中
+
+
+def fetch_china_geomap_seed(lat, lng):
+    """④ 从本地中国地质图 GeoJSON 做离线点查，返回 raw_layer 风格的种子（最准的中国来源）。"""
+    if not CHINA_GEOMAP_GEOJSON:
+        return None
+    try:
+        with open(CHINA_GEOMAP_GEOJSON, "r", encoding="utf-8") as f:
+            gj = json.load(f)
+        for feat in gj.get("features", []):
+            geom = feat.get("geometry") or {}
+            gtype, coords = geom.get("type"), geom.get("coordinates")
+            hit = False
+            if gtype == "Polygon":
+                hit = _point_in_polygon(lng, lat, coords)
+            elif gtype == "MultiPolygon":
+                hit = any(_point_in_polygon(lng, lat, poly) for poly in coords)
+            if not hit:
+                continue
+            props = feat.get("properties", {}) or {}
+
+            def grab(keys):
+                low = {k.lower(): v for k, v in props.items()}
+                for key in keys:
+                    if key in props:
+                        return props[key]
+                    if key.lower() in low:
+                        return low[key.lower()]
+                return None
+
+            lith = grab(CHINA_GEOMAP_FIELDS["lith"]) or grab(CHINA_GEOMAP_FIELDS["name"]) or "rock"
+            STATUS_INFO["msg"] = f"🗺️ 命中本地中国地质图要素：{lith}（坐标 {lat}, {lng}）。"
+            return {"name": str(lith), "lith": str(grab(CHINA_GEOMAP_FIELDS["lith"]) or ""),
+                    "color": grab(["color", "颜色"]) or "#8A96A0", "b_age": 200.0, "t_age": 0.0}
+        STATUS_INFO["net_error"] = "本地中国地质图已加载，但该坐标不在任何要素范围内。"
+    except Exception as exc:
+        STATUS_INFO["net_error"] = f"中国地质图读取失败：{type(exc).__name__}: {exc}"
+    return None
+
+
+def acquire_geology(lat, lng):
+    """数据获取总调度：返回 (real_layers 或 None, seed 或 None)。
+    ① 先试 Macrostrat 真实地层柱；拿不到则按优先级取地表种子交给推理引擎：
+       ④ 本地中国地质图 → ② Macrostrat /map → ② OneGeology。"""
+    try:
+        real = build_layers_from_units(fetch_macrostrat_units(lat, lng))
+        if real:
+            return real, None
+    except Exception as exc:
+        STATUS_INFO["net_error"] = f"真实地层柱处理失败，已回退推断：{type(exc).__name__}: {exc}"
+    seed = (fetch_china_geomap_seed(lat, lng)
+            or fetch_by_coordinates(lat, lng)
+            or fetch_onegeology_seed(lat, lng))
+    return None, seed
 
 def scientific_inference_engine(raw_layer):
     """【真·12轨双重物理推理引擎】完全由网络抓回来的[岩石名]与[地质年龄]裁决层数与肥瘦厚度"""
     global GLOBAL_WIGGLE_INTENSITY
     
     if raw_layer:
-        surf_name = raw_layer.get("name", "Unknown Bedrock").lower()
+        raw_name = (raw_layer.get("name") or "Unknown Bedrock").lower()
+        raw_lith = (raw_layer.get("lith") or "").lower()
         surf_color = raw_layer.get("color", "#8A96A0")
         b_age = float(raw_layer.get("b_age", 100.0))
         t_age = float(raw_layer.get("t_age", 0.0))
         STATUS_INFO["msg"] = f"🌐 联网成功！成功抓取坐标 ({LATITUDE}, {LONGITUDE}) 的真实地表数据。"
     else:
-        # 离线或未匹配时的完美自适应科学兜底（根据坐标的大体范围模拟，或默认给高精层理）
-        surf_name, surf_color, b_age, t_age = "sandstone", "#C77D55", 320.0, 250.0
-        STATUS_INFO["msg"] = f"🔌 离线保护激活！已转入本地高精参数化地质发生器。"
+        # 离线或未匹配时的自适应兜底（默认给一套砂岩高精层理）。
+        raw_name, raw_lith, surf_color, b_age, t_age = "sandstone", "", "#C77D55", 320.0, 250.0
+        reason = STATUS_INFO.get("net_error") or "未获取到联网数据"
+        STATUS_INFO["msg"] = f"🔌 离线兜底已激活（{reason}），当前为默认砂岩参数，非该坐标真实地质。"
 
     age_span = max(0.1, b_age - t_age)
-    STATUS_INFO["age_details"] = f"⏳ 原生岩性: {surf_name.upper()} | 寿命跨度: {age_span:.2f}Ma ({b_age}Ma - {t_age}Ma)"
+
+    # 岩性名归一化（针对中国等地常见的笼统返回值）：
+    # Macrostrat 在覆盖较粗的地区(如中国)往往只返回 "sedimentary rocks" /
+    # "igneous rocks" / "metamorphic rocks" 这类大类名，匹配不到任何具体岩石轨道，
+    # 旧逻辑会一律掉进默认片岩轨道。这里先尝试具体岩石名；匹配不到时，
+    # 再按沉积 / 碳酸盐 / 火山 / 侵入 / 变质大类，路由到一条代表性轨道。
+    # name 与 lith 字段一起参与匹配，提高命中率。
+    # 另外把常见中文岩性名翻成英文关键字追加进来，让本地中国地质图(中文属性)也能正确分轨。
+    search_text = f"{raw_name} {raw_lith}"
+    _zh_map = {
+        "石灰岩": "limestone", "灰岩": "limestone", "白云岩": "dolomite", "碳酸盐": "carbonate",
+        "砂岩": "sandstone", "粉砂岩": "siltstone", "页岩": "shale", "泥岩": "shale",
+        "砾岩": "conglomerate", "角砾岩": "breccia", "玄武岩": "basalt", "安山岩": "andesite",
+        "流纹岩": "rhyolite", "凝灰岩": "tuff", "花岗岩": "granite", "闪长岩": "diorite",
+        "辉长岩": "gabbro", "片麻岩": "gneiss", "片岩": "schist", "板岩": "slate",
+        "石英岩": "quartzite", "大理岩": "marble", "千枚岩": "phyllite", "煤": "coal",
+        "火山岩": "volcanic", "沉积岩": "sediment", "变质岩": "metamorph",
+        "岩浆岩": "igneous", "火成岩": "igneous", "侵入岩": "intrusive",
+    }
+    search_text += " " + " ".join(en for zh, en in _zh_map.items() if zh in search_text)
+    specific_keywords = [
+        "shale", "siltstone", "sandstone", "conglomerate", "breccia", "arkose",
+        "limestone", "dolomite", "basalt", "andesite", "rhyolite", "trachyte",
+        "tuff", "volcanic", "pyroclastic", "pumice", "granite", "granodiorite",
+        "diorite", "gabbro", "plutonic", "gneiss", "migmatite", "schist",
+        "slate", "quartzite", "marble", "phyllite",
+    ]
+    coarse_note = ""
+    if any(k in search_text for k in specific_keywords):
+        surf_name = search_text                       # 命中具体岩石名，按原逻辑分轨
+    elif any(k in search_text for k in ["carbonate", "calcareous"]):
+        surf_name, coarse_note = "limestone", "（按碳酸盐岩大类推断）"
+    elif "metamorph" in search_text:
+        surf_name, coarse_note = "gneiss", "（按变质岩大类推断）"
+    elif any(k in search_text for k in ["volcan", "extrusive", "lava", "pyroclast"]):
+        surf_name, coarse_note = "basalt", "（按火山岩大类推断）"
+    elif any(k in search_text for k in ["igneous", "intrusive", "plutonic", "magmat"]):
+        surf_name, coarse_note = "granite", "（按侵入岩大类推断）"
+    elif "sediment" in search_text:
+        surf_name, coarse_note = "sandstone", "（按沉积岩大类推断）"
+    else:
+        surf_name = search_text                       # 实在认不出，落入默认片岩轨道
+
+    STATUS_INFO["age_details"] = f"⏳ 原生岩性: {raw_name.upper()}{coarse_note} | 寿命跨度: {age_span:.2f}Ma ({b_age}Ma - {t_age}Ma)"
 
     # 解码基础设计色彩基因并创建高档同色系明暗调色链
     h = surf_color.lstrip("#")
@@ -161,6 +510,7 @@ def scientific_inference_engine(raw_layer):
     elif any(k in surf_name for k in ["gneiss", "migmatite", "complex"]):
         if b_age > 1000.0: GLOBAL_WIGGLE_INTENSITY *= 1.8
         STATUS_INFO["science_track"] = "🔬 物理推理：【太古代高压深部变质】➔ 6层强力揉皱剪切带"
+        w = [0.06, 0.30, 0.03, 0.34, 0.03, 0.24]
         names = ["🔝 山麓变质风化崩积粗碎土", "📄 条带状黑云斜长片麻岩", "⚡ 暗色斜长角闪岩剪切挤压带", "📄 富长英质交代重结晶混合岩", "⚡ 强烈长石化浅色交代微流线", "🧱 深部基性辉绿岩脉穿插底"]
         c = make_colors(6, base_rgb, 0.3)
 
@@ -189,10 +539,15 @@ def scientific_inference_engine(raw_layer):
 def build_foolproof_engine():
     global ERROR_MESSAGE
     
-    # ── 🛰️ 核心流程：读取控制台坐标 ➔ 联网刺探 ➔ 双重推理 ──
-    raw_layer = fetch_by_coordinates(LATITUDE, LONGITUDE)
-    chosen_layers = scientific_inference_engine(raw_layer)
-    
+    # ── 🛰️ 核心流程：分级数据获取 ➔ 真实优先/推断兜底 ➔ (可选)CRUST1.0 层厚偏置 ──
+    real_layers, seed = acquire_geology(LATITUDE, LONGITUDE)
+    if real_layers:
+        chosen_layers = real_layers                          # ① 真实地层柱
+    else:
+        chosen_layers = scientific_inference_engine(seed)    # ②→推理引擎（含离线兜底）
+    chosen_layers = apply_crust1_cover_bias(chosen_layers, LATITUDE, LONGITUDE)  # ③ 可选
+    STATUS_INFO["layer_count"] = len(chosen_layers)
+
     obj = bpy.context.active_object
     if not obj or obj.type != "MESH":
         if "天池DEM2" in bpy.data.objects: 
@@ -275,10 +630,21 @@ def build_foolproof_engine():
         
     out = next((n for n in nodes if n.type == "OUTPUT_MATERIAL"), None) or nodes.new("ShaderNodeOutputMaterial")
     out.location = (350, 0); links.new(prev_socket, out.inputs["Surface"])
-    
-    for area in bpy.context.screen.areas:
-        if area.type == 'NODE_EDITOR':
-            ctx = bpy.context.copy(); ctx['area'] = area; bpy.ops.node.view_all(ctx); break
+
+    # 自动缩放节点编辑器视图。Blender 4.x 用 temp_override；
+    # 旧版回退到 2.9x 的 dict 覆盖写法。失败也不影响材质本身已经建好。
+    try:
+        screen = getattr(bpy.context, "screen", None)
+        for area in (screen.areas if screen else []):
+            if area.type == "NODE_EDITOR":
+                if hasattr(bpy.context, "temp_override"):
+                    with bpy.context.temp_override(area=area):
+                        bpy.ops.node.view_all()
+                else:
+                    ctx = bpy.context.copy(); ctx["area"] = area; bpy.ops.node.view_all(ctx)
+                break
+    except Exception:
+        pass
     return True
 
 def draw_success_popup(self, context):

@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GeoTexture · 地层推演测试台</title>
+<style>
+  :root{
+    --bg:#0f172a; --panel:rgba(30,41,59,.7); --txt:#f8fafc; --txt2:#94a3b8;
+    --accent:#38bdf8; --border:rgba(255,255,255,.1); --good:#4ade80; --warn:#fbbf24;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font-family:'Inter','PingFang SC','Microsoft YaHei',sans-serif;
+       line-height:1.5;padding:24px;}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--txt2);font-size:13px;margin-bottom:20px}
+  .wrap{display:grid;grid-template-columns:360px 1fr;gap:20px;max-width:1080px}
+  @media(max-width:820px){.wrap{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px;backdrop-filter:blur(16px)}
+  label{display:block;font-size:12px;color:var(--txt2);margin:10px 0 4px}
+  input{width:100%;padding:9px 11px;background:rgba(0,0,0,.25);border:1px solid var(--border);
+        border-radius:8px;color:var(--txt);font-size:14px}
+  .row{display:flex;gap:10px}
+  .row>div{flex:1}
+  button{cursor:pointer;border:none;border-radius:8px;font-size:14px;font-weight:600;transition:.15s}
+  .go{width:100%;margin-top:14px;padding:11px;background:var(--accent);color:#06283d}
+  .go:hover{filter:brightness(1.1)}
+  .go:disabled{opacity:.5;cursor:wait}
+  .presets{display:flex;flex-wrap:wrap;gap:7px;margin-top:12px}
+  .presets button{padding:6px 10px;font-size:12px;font-weight:500;background:rgba(255,255,255,.06);color:var(--txt);border:1px solid var(--border)}
+  .presets button:hover{background:rgba(56,189,248,.15);border-color:var(--accent)}
+  .status{margin-top:14px;font-size:12.5px;border-radius:8px;padding:11px;background:rgba(0,0,0,.22);border:1px solid var(--border);white-space:pre-wrap;min-height:42px}
+  .badge{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;margin-bottom:8px}
+  .b-real{background:rgba(74,222,128,.15);color:var(--good);border:1px solid rgba(74,222,128,.4)}
+  .b-infer{background:rgba(251,191,36,.15);color:var(--warn);border:1px solid rgba(251,191,36,.4)}
+  .col-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px}
+  .col-head h2{font-size:15px;margin:0}
+  .stack{display:flex;flex-direction:column-reverse;border-radius:10px;overflow:hidden;border:1px solid var(--border)}
+  .layer{display:flex;align-items:center;gap:10px;padding:0 12px;min-height:30px;font-size:12.5px;
+         color:#0a0a0a;text-shadow:0 1px 1px rgba(255,255,255,.25);position:relative}
+  .layer .pct{margin-left:auto;font-variant-numeric:tabular-nums;opacity:.7;font-size:11px}
+  .marker{outline:1px dashed rgba(0,0,0,.35);outline-offset:-3px}
+  .axis{font-size:11px;color:var(--txt2);display:flex;justify-content:space-between;margin-top:6px}
+  .empty{color:var(--txt2);font-size:13px;padding:40px 0;text-align:center}
+  code{background:rgba(255,255,255,.08);padding:1px 5px;border-radius:4px;font-size:12px}
+  .foot{margin-top:18px;font-size:11.5px;color:var(--txt2)}
+</style>
+</head>
+<body>
+  <h1>GeoTexture · 地层推演测试台</h1>
+  <div class="sub">输入任意经纬度，实时复刻脚本的分级管道：①Macrostrat 真实地层柱 → ②/map+推理引擎（含中文/大类归一化）。这是浏览器侧预览，与 Blender 脚本同一套决策逻辑。</div>
+  <div class="wrap">
+    <div class="card">
+      <div class="row">
+        <div><label>纬度 Latitude</label><input id="lat" type="number" step="0.001" value="36.100"></div>
+        <div><label>经度 Longitude</label><input id="lng" type="number" step="0.001" value="-112.100"></div>
+      </div>
+      <div class="presets" id="presets"></div>
+      <button class="go" id="go">查询并推演</button>
+      <div class="status" id="status">准备就绪。试试美国大峡谷(真实地层柱)或四川盆地(中文/推断)。</div>
+    </div>
+    <div class="card">
+      <div class="col-head">
+        <h2 id="colTitle">地层柱</h2>
+        <span id="prov"></span>
+      </div>
+      <div id="result"><div class="empty">尚无结果 — 点击「查询并推演」</div></div>
+    </div>
+  </div>
+  <div class="foot">数据来源：Macrostrat API (CC-BY 4.0)。真实地层柱多见于北美；中国境内通常无柱状数据，走推理引擎。OneGeology / CRUST1.0 / 本地中国地质图为脚本侧可选源，本页不含。</div>
+
+<script>
+const PRESETS=[
+  ["大峡谷·沉积岩",36.100,-112.100],["犹他州·真实柱",40.500,-111.500],
+  ["四川盆地·灰岩",29.500,105.200],["长白山·流纹岩",42.002,128.058],
+  ["泰山·片麻岩",36.255,117.102],["塔里木",39.500,84.000],
+];
+const pc=document.getElementById('presets');
+PRESETS.forEach(([n,la,lo])=>{const b=document.createElement('button');b.textContent=n;
+  b.onclick=()=>{lat.value=la;lng.value=lo;run();};pc.appendChild(b);});
+
+// ---------- 颜色工具 ----------
+function hexToRgb(h){h=h.replace('#','');return [0,2,4].map(i=>parseInt(h.substr(i,2),16)/255);}
+function rgbToHex(r){return '#'+r.map(v=>Math.round(Math.max(.01,Math.min(.99,v))*255).toString(16).padStart(2,'0')).join('');}
+function makeColors(count,base,intensity=0.28){const out=[];for(let i=0;i<count;i++){
+  const f=1+(((i/Math.max(1,count-1))*2-1)*intensity);out.push(rgbToHex(base.map(v=>v*f)));}return out;}
+
+const LITH_COLOR={sandstone:"#C8A165",sand:"#D8C18A",shale:"#6B7B6B",mudstone:"#7A7A6E",siltstone:"#B59E78",
+  claystone:"#7A7466",clay:"#7A7466",limestone:"#8FB6C9",dolomite:"#C9B79B",carbonate:"#9FC0CF",chalk:"#E6E6DA",
+  conglomerate:"#A98B6B",breccia:"#9C7E63",coal:"#23211F",evaporite:"#E2D7C0",basalt:"#46464E",andesite:"#8A7A6A",
+  rhyolite:"#C9B6A0",tuff:"#BDB29C",volcanic:"#6A5A55",granite:"#D8B0A0",granodiorite:"#CBA694",gabbro:"#3E4248",
+  diorite:"#9A8E84",gneiss:"#B0A0B8",schist:"#8C8C7A",marble:"#E0E0E0",quartzite:"#D8D2C0",slate:"#4A4F58",phyllite:"#7C8070"};
+const CLASS_COLOR={sedimentary:"#B0A080",igneous:"#6A5F5A",metamorphic:"#8A8A92"};
+function unitColor(u){const liths=u.lith||[];const blob=liths.map(l=>(l.name||'')+' '+(l.type||'')).join(' ').toLowerCase();
+  for(const k in LITH_COLOR)if(blob.includes(k))return LITH_COLOR[k];
+  for(const l of liths){const c=CLASS_COLOR[(l.class||'').toLowerCase()];if(c)return c;}return "#8A96A0";}
+
+// ---------- ① 真实地层柱 ----------
+function buildFromUnits(units){
+  units=(units||[]).filter(Boolean);if(!units.length)return null;
+  units.sort((a,b)=>(+a.t_age||0)-(+b.t_age||0));
+  const W=u=>{const mt=+u.max_thick||0;if(mt>0)return mt;const s=Math.abs((+u.b_age||0)-(+u.t_age||0));return s>0?s:1;};
+  const raw=units.map(W),tot=raw.reduce((a,b)=>a+b,0)||1;
+  let bot=0;const out=[],n=units.length;
+  units.forEach((u,i)=>{const top=i===n-1?0.999:bot+raw[i]/tot*0.999;
+    const nm=u.unit_name||u.Fm||u.Gp||"未命名单元";const lt=(u.lith&&u.lith[0]&&u.lith[0].name)||"";
+    const mark=i===0?"🔝":(i===n-1?"🧱":"📄");
+    let label=`${mark} ${nm}`;if(lt)label+=`·${lt}`;
+    if(u.b_age!=null&&u.t_age!=null)label+=` (${u.t_age}-${u.b_age}Ma)`;
+    out.push({name:label,color:unitColor(u),bot,top:Math.min(top,0.999)});bot=top;});
+  return out;
+}
+
+// ---------- ② 推理引擎（中文/大类归一化 + 12 轨道，与脚本一致）----------
+const ZH={"石灰岩":"limestone","灰岩":"limestone","白云岩":"dolomite","碳酸盐":"carbonate","砂岩":"sandstone",
+  "粉砂岩":"siltstone","页岩":"shale","泥岩":"shale","砾岩":"conglomerate","角砾岩":"breccia","玄武岩":"basalt",
+  "安山岩":"andesite","流纹岩":"rhyolite","凝灰岩":"tuff","花岗岩":"granite","闪长岩":"diorite","辉长岩":"gabbro",
+  "片麻岩":"gneiss","片岩":"schist","板岩":"slate","石英岩":"quartzite","大理岩":"marble","千枚岩":"phyllite",
+  "煤":"coal","火山岩":"volcanic","沉积岩":"sediment","变质岩":"metamorph","岩浆岩":"igneous","火成岩":"igneous","侵入岩":"intrusive"};
+const SPECIFIC=["shale","siltstone","sandstone","conglomerate","breccia","arkose","limestone","dolomite","basalt",
+  "andesite","rhyolite","trachyte","tuff","volcanic","pyroclastic","pumice","granite","granodiorite","diorite",
+  "gabbro","plutonic","gneiss","migmatite","schist","slate","quartzite","marble","phyllite"];
+
+function inferEngine(seed){
+  let raw_name=(seed&&seed.name||"sandstone").toLowerCase();
+  let raw_lith=(seed&&seed.lith||"").toLowerCase();
+  let color=seed&&seed.color||"#C77D55";
+  let b=(seed&&seed.b_age!=null)?+seed.b_age:320, t=(seed&&seed.t_age!=null)?+seed.t_age:250;
+  if(isNaN(b))b=320;if(isNaN(t))t=250;
+  let st=raw_name+" "+raw_lith;
+  for(const zh in ZH)if(st.includes(zh))st+=" "+ZH[zh];
+  const span=Math.max(0.1,b-t);
+  let surf,note="";
+  if(SPECIFIC.some(k=>st.includes(k)))surf=st;
+  else if(["carbonate","calcareous"].some(k=>st.includes(k))){surf="limestone";note="（碳酸盐大类）";}
+  else if(st.includes("metamorph")){surf="gneiss";note="（变质岩大类）";}
+  else if(["volcan","extrusive","lava","pyroclast"].some(k=>st.includes(k))){surf="basalt";note="（火山岩大类）";}
+  else if(["igneous","intrusive","plutonic","magmat"].some(k=>st.includes(k))){surf="granite";note="（侵入岩大类）";}
+  else if(st.includes("sediment")){surf="sandstone";note="（沉积岩大类）";}
+  else surf=st;
+  const base=hexToRgb(color);let w,names,c,track;
+  const has=k=>surf.includes(k),any=arr=>arr.some(k=>surf.includes(k));
+  if(has("shale")){if(span>15){track="长寿型深海静水页岩 ➔ 12层微页理";w=[.03,.12,.02,.15,.02,.18,.02,.14,.02,.13,.12,.05];
+      names=["🔝风化覆土","📄富碳质页岩","⚡炭质线A","📄硅质页岩","⚡粉砂层理B","📄纹层页岩","⚡黄铁矿线C","📄储层核心","⚡剪切线D","📄粉砂页岩","📄高压异常带","🧱硬化灰岩"];}
+    else{track="突发期浅海泥岩 ➔ 6层";w=[.06,.42,.03,.25,.14,.10];names=["🔝泥质粗沙土","📄绿泥石砂质","⚡泥质界线","📄致密泥岩","📄水平层理","🧱古生代碎屑底"];}c=makeColors(w.length,base,.3);}
+  else if(has("siltstone")){track="浅海陆棚粉砂岩 ➔ 9层";w=[.05,.22,.03,.23,.03,.21,.13,.03,.07];
+    names=["🔝风化沙土","📄钙质粉砂岩","⚡铁质细界线","📄长石粉砂岩","⚡泥质极薄层","📄海相碎屑岩","📄海绿石层","⚡化石线","🧱碎屑封底"];c=makeColors(9,base,.25);}
+  else if(has("sandstone")){if(span>20){track="多阶长寿河流砂岩 ➔ 8层";w=[.04,.36,.12,.02,.22,.02,.14,.08];
+      names=["🔝坡积粗沙","📄石英砂岩盘","📄交错粉砂岩","⚡铁质红界线","📄长石重力流","⚡钙质白线","📄红层泥岩","🧱前寒武底"];}
+    else{track="短期陆相河流砂岩 ➔ 5层";w=[.08,.52,.20,.12,.08];names=["🔝沙质冲积","📄巨厚粉砂岩","📄泥质交错层","📄铁质致密层","🧱剥蚀不整合"];}c=makeColors(w.length,base,.35);}
+  else if(any(["conglomerate","breccia","arkose"])){track="山麓滑塌 ➔ 6层粗粒角砾岩";w=[.08,.44,.03,.29,.07,.09];
+    names=["🔝粗砾土","📄鹅卵砾岩盘","⚡冲刷面","📄角砾流体","📄砂胶结砾岩","🧱变质岩床"];c=makeColors(6,base,.22);}
+  else if(has("limestone")){track="碳酸盐岩生物建造 ➔ 10层";w=[.06,.26,.02,.14,.12,.02,.14,.12,.02,.10];
+    names=["🔝喀斯特红土","📄鲕状灰岩盘","⚡燧石条带","📄白云质灰岩","📄腕足化石带","⚡缝合线","📄竹叶状灰岩","📄微晶页岩","⚡风化软化带","🧱重结晶白云岩"];c=makeColors(10,base,.26);}
+  else if(has("dolomite")){track="泻湖潮坪蒸发相 ➔ 7层白云岩";w=[.06,.36,.02,.24,.03,.19,.10];
+    names=["🔝刀砍状表土","📄砂糖状白云岩","⚡石膏晶斑线","📄薄层白云岩","⚡硅质交代面","📄微晶白云岩","🧱震旦硅质岩"];c=makeColors(7,base,.2);}
+  else if(has("basalt")){track="基性溢流火成岩 ➔ 9层";w=[.05,.17,.02,.34,.03,.17,.03,.11,.08];
+    names=["🔝红土化表土","📄致密熔岩体","⚡多孔杏仁体","📄柱状节理玄武岩","⚡风化夹层","📄隐晶玄武岩","⚡熔岩前缘","📄斑状玄武岩","🧱深海沉积托底"];c=makeColors(9,base,.24);}
+  else if(has("andesite")){track="中性斑状熔岩锥 ➔ 8层";w=[.06,.29,.02,.25,.03,.17,.10,.08];
+    names=["🔝粘土角砾土","📄斜长石斑岩","⚡角闪石流线","📄辉石安山岩","⚡集块岩夹层","📄英安岩交代带","⏳火山颈剪切带","🧱基底硬化底"];c=makeColors(8,base,.25);}
+  else if(any(["rhyolite","trachyte","tuff","volcanic","pyroclastic","pumice"])){
+    if(span<5){track="灾变骤发火成碎屑 ➔ 4层";w=[.05,.73,.03,.19];c=["#EBE4D8",color,"#141414","#24201D"];
+      names=["🔝风化火山灰","📄熔结凝灰岩盘","⚡黑曜岩线","🧱结晶底"];}
+    else{track="演化期酸性火山岩 ➔ 7层";w=[.07,.38,.02,.25,.03,.16,.09];
+      names=["🔝浮石层","📄流纹岩体","⚡黑曜岩线","📄角砾熔岩","⚡气腔线","⏳集块岩带","🧱盾底"];c=makeColors(7,base,.3);}}
+  else if(any(["granite","granodiorite","diorite","gabbro","plutonic"])){track="深成岩浆岩基 ➔ 4层";w=[.08,.75,.03,.14];
+    names=["🔝球状风化沙土","📄结晶花岗岩基体","⚡伟晶岩热液脉","🧱基性包裹体底"];c=["#CCAFA4",color,"#EADCD6","#3D3431"];}
+  else if(any(["gneiss","migmatite","complex"])){track="太古代高压深部变质 ➔ 6层";w=[.06,.30,.03,.34,.03,.24];
+    names=["🔝崩积粗碎土","📄条带状片麻岩","⚡剪切挤压带","📄混合岩","⚡浅色微流线","🧱辉绿岩脉底"];c=makeColors(6,base,.3);}
+  else{track="区域动力中阶变质 ➔ 5层片岩";w=[.05,.41,.03,.33,.18];
+    names=["🔝绢云母表土","📄绢云母片岩","⚡石英脉","📄绿泥石千枚岩","🧱泥质原岩核"];c=makeColors(5,base,.28);}
+  let bot=0;const layers=[];
+  for(let i=0;i<w.length;i++){const top=i===w.length-1?0.999:bot+w[i];
+    layers.push({name:names[i],color:c[i],bot:+bot.toFixed(4),top:+Math.min(top,0.999).toFixed(4)});bot=top;}
+  return {layers,track,note,rock:(raw_name).toUpperCase(),span,b,t};
+}
+
+// ---------- 网络 ----------
+async function getJSON(url){const r=await fetch(url);if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}
+
+async function run(){
+  const la=parseFloat(lat.value),lo=parseFloat(lng.value);
+  const S=document.getElementById('status'),R=document.getElementById('result'),
+        P=document.getElementById('prov'),T=document.getElementById('colTitle'),go=document.getElementById('go');
+  if(isNaN(la)||isNaN(lo)){S.textContent="请输入有效经纬度。";return;}
+  go.disabled=true;go.textContent="查询中…";S.textContent="① 正在查询 Macrostrat 真实地层柱 /units …";
+  P.innerHTML="";R.innerHTML='<div class="empty">查询中…</div>';
+  try{
+    let units=[];
+    try{const u=await getJSON(`https://macrostrat.org/api/v2/units?lat=${la}&lng=${lo}&response=long`);
+      units=(u.success&&u.success.data)||[];}catch(e){}
+    let real=buildFromUnits(units);
+    if(real){
+      T.textContent="地层柱（真实数据）";
+      P.innerHTML='<span class="badge b-real">① Macrostrat 真实地层柱</span>';
+      S.textContent=`✅ 命中真实地层柱：${real.length} 个命名地层单元。\n来源 Macrostrat /units（北美覆盖密）。`;
+      render(real);
+    }else{
+      S.textContent="② 无真实地层柱，改取地表种子 /map，交给推理引擎…";
+      let seed=null;
+      try{const m=await getJSON(`https://macrostrat.org/api/v2/geologic_units/map?lat=${la}&lng=${lo}`);
+        const d=(m.success&&m.success.data)||[];if(d.length)seed=d[0];}catch(e){}
+      const res=inferEngine(seed);
+      T.textContent="地层柱（推理引擎）";
+      P.innerHTML='<span class="badge b-infer">② 推理引擎</span>';
+      const src=seed?`Macrostrat /map 地表单元`:`无联网数据·离线兜底(默认砂岩)`;
+      S.textContent=`⚠️ 推断结果（非真实分层）\n地表来源：${src}\n原生岩性：${res.rock} ${res.note}\n轨道：${res.track}\n年龄跨度：${res.span.toFixed(1)}Ma (${res.t}–${res.b}Ma)`;
+      render(res.layers);
+    }
+  }catch(e){S.textContent="出错："+e.message+"\n（若为 CORS/网络问题，Macrostrat 偶发不稳，可重试）";R.innerHTML='<div class="empty">查询失败</div>';}
+  go.disabled=false;go.textContent="查询并推演";
+}
+
+function render(layers){
+  const R=document.getElementById('result');
+  const H=420;
+  let html='<div class="stack" style="height:'+H+'px">';
+  layers.forEach(l=>{const pct=(l.top-l.bot);const h=Math.max(16,pct*H);
+    const mark=/⚡/.test(l.name)?' marker':'';
+    html+=`<div class="layer${mark}" style="background:${l.color};height:${h}px" title="${l.name}">`
+        +`<span>${l.name}</span><span class="pct">${(pct*100).toFixed(1)}%</span></div>`;});
+  html+='</div><div class="axis"><span>↑ 地表（最年轻）</span><span>基底（最老）↓</span></div>';
+  R.innerHTML=html;
+}
+document.getElementById('go').onclick=run;
+run();
+</script>
+</body>
+</html>
