@@ -113,6 +113,34 @@
 }
 
 /* Profile Area */
+.dragDivider {
+  flex: 0 0 12px;
+  height: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  cursor: row-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  z-index: 6;
+  touch-action: none;
+}
+
+.dragDivider::before {
+  content: "";
+  width: 52px;
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.4);
+  transition: background 0.15s;
+}
+
+.dragDivider:hover::before {
+  background: var(--accent);
+}
+
 .profileArea {
   height: 0;
   background: var(--bg-color);
@@ -247,7 +275,8 @@
 
 .surfaceTextureModes {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   gap: 4px;
 }
 

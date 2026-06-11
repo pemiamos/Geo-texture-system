@@ -93,6 +93,97 @@ const defaultTerrainLayers: TerrainLayer[] = [
   { name: "结晶基底", color: "#6f5f7f", textureFile: "legend_45_gneiss.png" },
 ];
 
+// Macrostrat /units（真实地层柱）单元结构
+interface MacrostratColumnUnit {
+  unit_name?: string;
+  Fm?: string;
+  Gp?: string;
+  t_age?: number;
+  b_age?: number;
+  max_thick?: number;
+  color?: string;
+  lith?: Array<{ name?: string; type?: string; class?: string }>;
+}
+
+// 岩性关键字 → 图例贴图 / 中文名 / 颜色
+const lithTextureTable: Array<[string, { file: string; name: string; color: string }]> = [
+  ["limestone", { file: "legend_15_massively_bedded_limestone.png", name: "灰岩", color: "#8fb6c9" }],
+  ["carbonate", { file: "legend_15_massively_bedded_limestone.png", name: "碳酸盐岩", color: "#9fc0cf" }],
+  ["dolomite", { file: "legend_19_dolomite.png", name: "白云岩", color: "#c9b79b" }],
+  ["chalk", { file: "legend_22_chalk.png", name: "白垩", color: "#e6e6da" }],
+  ["sandstone", { file: "legend_08_massive_sandstone.png", name: "砂岩", color: "#c8a165" }],
+  ["siltstone", { file: "legend_12_thin_bedded_or_shaly_sandstone.png", name: "粉砂岩", color: "#b59e78" }],
+  ["conglomerate", { file: "legend_07_conglomerate.png", name: "砾岩", color: "#a98b6b" }],
+  ["breccia", { file: "legend_40_breccia.png", name: "角砾岩", color: "#9c7e63" }],
+  ["shale", { file: "legend_25_shale.png", name: "页岩", color: "#6b7b6b" }],
+  ["mudstone", { file: "legend_25_shale.png", name: "泥岩", color: "#7a7a6e" }],
+  ["claystone", { file: "legend_28_clay.png", name: "黏土岩", color: "#7a7466" }],
+  ["clay", { file: "legend_28_clay.png", name: "黏土", color: "#7a7466" }],
+  ["coal", { file: "legend_31_coal.png", name: "煤", color: "#23211f" }],
+  ["chert", { file: "legend_18_bedded_chert.png", name: "燧石", color: "#9aa0a6" }],
+  ["gypsum", { file: "legend_37_gypsum.png", name: "石膏", color: "#e2d7c0" }],
+  ["salt", { file: "legend_38_salt.png", name: "盐岩", color: "#e8e2d2" }],
+  ["sand", { file: "legend_02_sand.png", name: "砂", color: "#e0c48a" }],
+  ["gravel", { file: "legend_03_gravel_and_stratified_drift.png", name: "砂砾", color: "#c9b08a" }],
+  ["basalt", { file: "legend_52_basaltic_flows.png", name: "玄武岩", color: "#46464e" }],
+  ["andesite", { file: "legend_53_bedded_lava_andesitic.png", name: "安山岩", color: "#8a7a6a" }],
+  ["rhyolite", { file: "legend_50_volcanic_breccia_and_tuff.png", name: "流纹岩", color: "#c9b6a0" }],
+  ["tuff", { file: "legend_50_volcanic_breccia_and_tuff.png", name: "凝灰岩", color: "#bdb29c" }],
+  ["volcanic", { file: "legend_52_basaltic_flows.png", name: "火山岩", color: "#6a5a55" }],
+  ["granite", { file: "legend_55_granite.png", name: "花岗岩", color: "#d8b0a0" }],
+  ["granodiorite", { file: "legend_55_granite.png", name: "花岗闪长岩", color: "#cba694" }],
+  ["diorite", { file: "legend_55_granite.png", name: "闪长岩", color: "#9a8e84" }],
+  ["gabbro", { file: "legend_57_massive_igneous_rock_57.png", name: "辉长岩", color: "#3e4248" }],
+  ["gneiss", { file: "legend_45_gneiss.png", name: "片麻岩", color: "#b0a0b8" }],
+  ["schist", { file: "legend_48_schist.png", name: "片岩", color: "#8c8c7a" }],
+  ["slate", { file: "legend_27_slate.png", name: "板岩", color: "#4a4f58" }],
+  ["quartzite", { file: "legend_11_quartzite.png", name: "石英岩", color: "#d8d2c0" }],
+  ["marble", { file: "legend_20_marble.png", name: "大理岩", color: "#e0e0e0" }],
+];
+
+const lithClassDefault: Record<string, { file: string; name: string; color: string }> = {
+  sedimentary: { file: "legend_08_massive_sandstone.png", name: "沉积岩", color: "#b0a080" },
+  igneous: { file: "legend_55_granite.png", name: "火成岩", color: "#6a5f5a" },
+  metamorphic: { file: "legend_45_gneiss.png", name: "变质岩", color: "#8a8a92" },
+};
+
+function lithInfoForUnit(unit: MacrostratColumnUnit) {
+  const liths = unit.lith ?? [];
+  const blob = liths.map((l) => `${l.name ?? ""} ${l.type ?? ""}`).join(" ").toLowerCase();
+  for (const [keyword, info] of lithTextureTable) {
+    if (blob.includes(keyword)) return info;
+  }
+  const cls = (liths[0]?.class ?? "").toLowerCase();
+  if (cls.includes("igneous")) return lithClassDefault.igneous;
+  if (cls.includes("metamorphic")) return lithClassDefault.metamorphic;
+  return lithClassDefault.sedimentary;
+}
+
+// 把 Macrostrat 真实地层柱转成自顶向下的 TerrainLayer[]（年轻在上、最老在下）。
+const maxRealLayers = 14;
+function buildLayersFromUnits(units: MacrostratColumnUnit[]): TerrainLayer[] | null {
+  let list = units.filter(Boolean);
+  if (list.length < 3) return null; // 太少没必要，交回模板
+  list = list.slice().sort((a, b) => (Number(a.t_age) || 0) - (Number(b.t_age) || 0));
+  if (list.length > maxRealLayers) {
+    const sampled: MacrostratColumnUnit[] = [];
+    for (let i = 0; i < maxRealLayers; i++) {
+      sampled.push(list[Math.round((i * (list.length - 1)) / (maxRealLayers - 1))]);
+    }
+    list = sampled;
+  }
+  return list.map((unit) => {
+    const info = lithInfoForUnit(unit);
+    const baseName = unit.unit_name || unit.Fm || unit.Gp || info.name;
+    const age = unit.t_age != null && unit.b_age != null ? ` ${unit.t_age}-${unit.b_age}Ma` : "";
+    return {
+      name: `${baseName}·${info.name}${age}`,
+      color: unit.color || info.color,
+      textureFile: info.file,
+    };
+  });
+}
+
 const geologicAgeNames: Record<string, string> = {
   "holocene": "全新世",
   "pleistocene": "更新世",
@@ -441,11 +532,15 @@ export default function MapSelector() {
   const [isEstimating, setIsEstimating] = useState(false);
   const [isRenderingBlock, setIsRenderingBlock] = useState(false);
   const [terrainBlock, setTerrainBlock] = useState<TerrainBlockData | null>(null);
+  const [profileHeight, setProfileHeight] = useState<number | null>(null);
+  const [showContours, setShowContours] = useState(false);
   const d3Container = useRef<SVGSVGElement>(null);
   const mapContainer = useRef<HTMLDivElement>(null);
   const map = useRef<mapboxgl.Map | null>(null);
   const draw = useRef<MapboxDraw | null>(null);
   const rectangleStart = useRef<mapboxgl.LngLat | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const draggingDivider = useRef(false);
 
   useEffect(() => {
     const token = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
@@ -509,13 +604,68 @@ export default function MapSelector() {
     map.current.addControl(draw.current);
 
     map.current.on('load', () => {
-      map.current!.addSource('mapbox-dem', {
+      const mapInstance = map.current!;
+      mapInstance.addSource('mapbox-dem', {
         'type': 'raster-dem',
         'url': 'mapbox://mapbox.mapbox-terrain-dem-v1',
         'tileSize': 512,
         'maxzoom': 14
       });
-      map.current!.setTerrain({ 'source': 'mapbox-dem', 'exaggeration': 1 });
+      mapInstance.setTerrain({ 'source': 'mapbox-dem', 'exaggeration': 1 });
+
+      // Mapbox Terrain v2 矢量等高线（默认隐藏，由「等高线」开关控制）
+      mapInstance.addSource('contour-terrain', {
+        type: 'vector',
+        url: 'mapbox://mapbox.mapbox-terrain-v2',
+      });
+      // 首曲线（全部等高线）
+      mapInstance.addLayer({
+        id: 'contour-lines',
+        type: 'line',
+        source: 'contour-terrain',
+        'source-layer': 'contour',
+        layout: { visibility: 'none', 'line-join': 'round', 'line-cap': 'round' },
+        paint: {
+          'line-color': '#8a5a2b',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 11, 0.4, 16, 1.0],
+          'line-opacity': 0.5,
+        },
+      });
+      // 计曲线（每 5 条加粗：index >= 5）
+      mapInstance.addLayer({
+        id: 'contour-index',
+        type: 'line',
+        source: 'contour-terrain',
+        'source-layer': 'contour',
+        filter: ['>=', ['get', 'index'], 5],
+        layout: { visibility: 'none', 'line-join': 'round', 'line-cap': 'round' },
+        paint: {
+          'line-color': '#6b3f1d',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 11, 0.9, 16, 2.0],
+          'line-opacity': 0.85,
+        },
+      });
+      // 计曲线上的高程标注（ele 字段，米）
+      mapInstance.addLayer({
+        id: 'contour-labels',
+        type: 'symbol',
+        source: 'contour-terrain',
+        'source-layer': 'contour',
+        filter: ['>=', ['get', 'index'], 5],
+        layout: {
+          visibility: 'none',
+          'symbol-placement': 'line',
+          'text-field': ['concat', ['to-string', ['get', 'ele']], ' m'],
+          'text-size': 11,
+          'text-font': ['DIN Offc Pro Medium', 'Arial Unicode MS Regular'],
+          'symbol-spacing': 300,
+        },
+        paint: {
+          'text-color': '#5a3416',
+          'text-halo-color': '#ffffff',
+          'text-halo-width': 1.4,
+        },
+      });
     });
 
     return () => {
@@ -525,6 +675,23 @@ export default function MapSelector() {
       }
     };
   }, []);
+
+  // 切换 Mapbox 矢量等高线图层的显隐
+  useEffect(() => {
+    const mapInstance = map.current;
+    if (!mapInstance) return;
+    const apply = () => {
+      const visibility = showContours ? "visible" : "none";
+      ["contour-lines", "contour-index", "contour-labels"].forEach((id) => {
+        if (mapInstance.getLayer(id)) mapInstance.setLayoutProperty(id, "visibility", visibility);
+      });
+    };
+    if (mapInstance.isStyleLoaded() && mapInstance.getLayer("contour-lines")) {
+      apply();
+    } else {
+      mapInstance.once("idle", apply);
+    }
+  }, [showContours]);
 
   useEffect(() => {
     if (!draw.current || !map.current) return;
@@ -613,6 +780,19 @@ export default function MapSelector() {
   }, []);
 
   const inferTerrainLayers = useCallback(async (lat: number, lng: number): Promise<TerrainLayer[]> => {
+    // ① 优先取 Macrostrat 真实地层柱（/units）——北美等覆盖区会得到详细的命名地层序列
+    try {
+      const columnResponse = await fetch(
+        `https://macrostrat.org/api/v2/units?lat=${lat}&lng=${lng}&response=long`,
+      );
+      const columnData = await columnResponse.json();
+      const columnUnits = columnData?.success?.data as MacrostratColumnUnit[] | undefined;
+      const realLayers = buildLayersFromUnits(columnUnits ?? []);
+      if (realLayers) return realLayers;
+    } catch {
+      // 忽略，转入 /map 推断兜底
+    }
+    // ② 无真实地层柱（如中国）→ 用地表单元推断 4 层模板
     try {
       const response = await fetch(`https://macrostrat.org/api/v2/geologic_units/map?lat=${lat}&lng=${lng}`);
       const data = await response.json();
@@ -1027,8 +1207,36 @@ export default function MapSelector() {
     addLabel(500, 320, l4Info.name);
   };
 
+  const profileOpen = hasProfile || isEstimating || Boolean(terrainBlock) || isRenderingBlock;
+
+  const handleDividerDown = useCallback((event: React.PointerEvent) => {
+    event.preventDefault();
+    draggingDivider.current = true;
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "row-resize";
+
+    function onMove(e: PointerEvent) {
+      if (!draggingDivider.current || !containerRef.current) return;
+      // 距底部高度 = 下视窗高度；夹在合理范围，避免拖到看不见
+      const rect = containerRef.current.getBoundingClientRect();
+      const next = clamp(rect.bottom - e.clientY, 160, rect.height - 140);
+      setProfileHeight(next);
+      map.current?.resize();
+    }
+    function onUp() {
+      draggingDivider.current = false;
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      map.current?.resize();
+    }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }, []);
+
   return (
-    <div className={styles.container}>
+    <div className={styles.container} ref={containerRef}>
       {/* Top Map Section */}
       <div className={styles.mapArea}>
         <div className={styles.mapOverlay}>
@@ -1052,6 +1260,12 @@ export default function MapSelector() {
             >
               <Square size={16} /> 框选 3D 地块
             </button>
+            <button
+              className={`${styles.controlBtn} ${showContours ? styles.active : ""}`}
+              onClick={() => setShowContours((v) => !v)}
+            >
+              <MapIcon size={16} /> 等高线
+            </button>
             {(isDrawing || hasDrawnLine) && (
               <button className={styles.actionBtn} onClick={generateProfile}>
                 生成地质剖面
@@ -1074,8 +1288,23 @@ export default function MapSelector() {
         <div ref={mapContainer} style={{ width: "100%", height: "100%" }} />
       </div>
 
+      {/* Draggable divider between the map and the profile/3D viewport */}
+      {profileOpen && (
+        <div
+          className={styles.dragDivider}
+          role="separator"
+          aria-orientation="horizontal"
+          title="拖动调整上下视窗大小"
+          onPointerDown={handleDividerDown}
+          onDoubleClick={() => setProfileHeight(null)}
+        />
+      )}
+
       {/* Bottom Profile Section */}
-      <div className={`${styles.profileArea} ${hasProfile || isEstimating || terrainBlock || isRenderingBlock ? styles.open : ""}`}>
+      <div
+        className={`${styles.profileArea} ${profileOpen ? styles.open : ""}`}
+        style={profileOpen && profileHeight != null ? { height: profileHeight, transition: "none" } : undefined}
+      >
         <div className={styles.profileHeader}>
           <h3>{terrainBlock || isRenderingBlock ? "DEM + 地下岩层 3D 地块" : "AI 生成的地下地质剖面"}</h3>
           {hasProfile && (

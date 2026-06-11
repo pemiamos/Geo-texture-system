@@ -5,6 +5,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { Download } from "lucide-react";
 import type { Geometry } from "geojson";
+import { contours } from "d3";
 import styles from "./MapSelector.module.css";
 
 export interface TerrainLayer {
@@ -63,6 +64,9 @@ interface SurfaceTextureSettings {
   gridLineColor: string;
   gridFillColor: string;
   gridPatchColor: string;
+  contourLineColor: string;
+  contourLabelScale: number;
+  contourBasemap: "hypso" | "map";
   waterColor: string;
   waterOpacity: number;
   facetSize: number;
@@ -71,7 +75,7 @@ interface SurfaceTextureSettings {
 
 type SunPreset = "dawn" | "morning" | "day" | "evening";
 type ExportQuality = "normal" | "publication";
-type SurfaceRenderMode = "photo" | "grid" | "hybrid";
+type SurfaceRenderMode = "photo" | "grid" | "hybrid" | "contour";
 
 const maxPlanSize = 16;
 const minPlanSize = 3.5;
@@ -102,6 +106,21 @@ const defaultSurfaceRenderMode: SurfaceRenderMode = "photo";
 const defaultGridLineColor = "#7fbe73";
 const defaultGridFillColor = "#f5fbef";
 const defaultGridPatchColor = "#70b967";
+const defaultContourLineColor = "#6e4a2a";
+const defaultContourLabelScale = 1;
+const defaultContourBasemap: "hypso" | "map" = "hypso";
+
+// 等高线"真实地图"底图：Mapbox 静态图（基于 OSM 数据，CORS 安全）。
+// 样式可在 .env.local 用 NEXT_PUBLIC_CONTOUR_MAP_STYLE 配置（形如 "用户名/clxxxx"）；
+// 未配置时回退到下面的默认样式。需"只显示地理信息"时，在 Mapbox Studio 隐藏 label/road/admin 图层。
+const contourMapStyle =
+  process.env.NEXT_PUBLIC_CONTOUR_MAP_STYLE || "bag326/clux05hbo003101q18bsm2am7";
+function buildOutdoorsBasemapUrl(bounds: TerrainBlockData["bounds"], token: string) {
+  const { width, height } = getSurfaceTextureSize(bounds, mapboxStaticImageMaxSize);
+  const bbox = `[${bounds.west},${bounds.south},${bounds.east},${bounds.north}]`;
+  const params = new URLSearchParams({ access_token: token, attribution: "false", logo: "false" });
+  return `https://api.mapbox.com/styles/v1/${contourMapStyle}/static/${bbox}/${width}x${height}@2x?${params.toString()}`;
+}
 const defaultWaterColor = "#60b96b";
 const defaultWaterOpacity = 0.72;
 const defaultFacetSize = 18;
@@ -721,6 +740,7 @@ function drawDetectedWaterOverlay(
   height: number,
   color: string,
   opacity: number,
+  strength = 0.45,
 ) {
   const imageData = context.getImageData(0, 0, width, height);
   const pixels = imageData.data;
@@ -734,7 +754,7 @@ function drawDetectedWaterOverlay(
     const waterScore = getWaterScore(red, green, blue, luma);
     if (waterScore <= 0.2) continue;
 
-    const waterOpacity = clamp((waterScore - 0.2) / 0.8, 0, 1) * opacity * 0.45;
+    const waterOpacity = clamp((waterScore - 0.2) / 0.8, 0, 1) * opacity * strength;
     blendPixel(pixels, index, waterColor, waterOpacity);
   }
 
@@ -839,11 +859,348 @@ function drawTerrainFacets(
   context.restore();
 }
 
+// 把原始 DEM 双线性上采样并做几次轻度盒滤波，得到更密、更平滑的高程场，
+// 这样 marching squares 提取出的等高线密度更高、线条更圆滑。
+function buildSmoothElevationField(
+  elev: number[][],
+  rows: number,
+  cols: number,
+  fill: number,
+) {
+  const sample = (r: number, c: number) => {
+    const rowArr = elev[r];
+    return rowArr && rowArr[c] != null ? rowArr[c] : fill;
+  };
+  // 上采样倍率：小地块多放大、大地块少放大，最终边长控制在 ~140–260 之间
+  const factor = clamp(Math.round(190 / Math.max(rows, cols)), 2, 6);
+  const w = (cols - 1) * factor + 1;
+  const h = (rows - 1) * factor + 1;
+  let field = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const gy = y / factor;
+    const r0 = Math.floor(gy);
+    const r1 = Math.min(r0 + 1, rows - 1);
+    const fy = gy - r0;
+    for (let x = 0; x < w; x++) {
+      const gx = x / factor;
+      const c0 = Math.floor(gx);
+      const c1 = Math.min(c0 + 1, cols - 1);
+      const fx = gx - c0;
+      const v00 = sample(r0, c0);
+      const v01 = sample(r0, c1);
+      const v10 = sample(r1, c0);
+      const v11 = sample(r1, c1);
+      field[y * w + x] =
+        v00 * (1 - fx) * (1 - fy) +
+        v01 * fx * (1 - fy) +
+        v10 * (1 - fx) * fy +
+        v11 * fx * fy;
+    }
+  }
+  // 3x3 盒滤波 2 趟，平滑掉锯齿
+  const blur = (src: Float32Array) => {
+    const out = new Float32Array(src.length);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let sum = 0;
+        let n = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const ny = y + dy;
+            const nx = x + dx;
+            if (ny < 0 || ny >= h || nx < 0 || nx >= w) continue;
+            sum += src[ny * w + nx];
+            n++;
+          }
+        }
+        out[y * w + x] = sum / n;
+      }
+    }
+    return out;
+  };
+  field = blur(blur(field));
+  return { values: Array.from(field), w, h, factor };
+}
+
+// 选一个"整数好看"的等高距，并随地块高差自动决定线条数量（高差越大线越多）。
+function chooseContourStep(span: number, targetLines: number) {
+  const rough = span / Math.max(targetLines, 1);
+  const mag = Math.pow(10, Math.floor(Math.log10(Math.max(rough, 1e-6))));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= rough);
+  return step ?? 10 * mag;
+}
+
+function strokeSmoothRing(
+  context: CanvasRenderingContext2D,
+  ring: number[][],
+  sx: number,
+  sy: number,
+) {
+  const n = ring.length;
+  if (n < 2) return;
+  context.moveTo(ring[0][0] * sx, ring[0][1] * sy);
+  if (n < 3) {
+    context.lineTo(ring[1][0] * sx, ring[1][1] * sy);
+    return;
+  }
+  // 经过各顶点的中点画二次贝塞尔，进一步圆滑折线
+  for (let i = 1; i < n - 1; i++) {
+    const cx = ring[i][0] * sx;
+    const cy = ring[i][1] * sy;
+    const mx = ((ring[i][0] + ring[i + 1][0]) / 2) * sx;
+    const my = ((ring[i][1] + ring[i + 1][1]) / 2) * sy;
+    context.quadraticCurveTo(cx, cy, mx, my);
+  }
+  context.lineTo(ring[n - 1][0] * sx, ring[n - 1][1] * sy);
+}
+
+// 高程设色（仿 Mapbox outdoors）：低地绿 → 黄绿 → 黄褐 → 棕。
+function hypsometricColor(ratio: number): [number, number, number] {
+  const stops: Array<[number, [number, number, number]]> = [
+    [0.0, [156, 191, 134]],
+    [0.3, [196, 207, 148]],
+    [0.55, [216, 194, 148]],
+    [0.78, [194, 154, 107]],
+    [1.0, [181, 137, 95]],
+  ];
+  let lo = stops[0];
+  let hi = stops[stops.length - 1];
+  for (let i = 0; i < stops.length - 1; i++) {
+    if (ratio >= stops[i][0] && ratio <= stops[i + 1][0]) {
+      lo = stops[i];
+      hi = stops[i + 1];
+      break;
+    }
+  }
+  const t = (ratio - lo[0]) / Math.max(hi[0] - lo[0], 1e-6);
+  return [
+    lo[1][0] + (hi[1][0] - lo[1][0]) * t,
+    lo[1][1] + (hi[1][1] - lo[1][1]) * t,
+    lo[1][2] + (hi[1][2] - lo[1][2]) * t,
+  ];
+}
+
+// 等高线模式的地形底图：高程设色 + 山体阴影（取代纯白底），观感接近上方 Mapbox 地图。
+// 关键：先在 DEM 原始分辨率上着色，再用 canvas 双线性平滑放大到贴图尺寸，
+// 避免直接逐像素采样粗 DEM 产生的"马赛克"块状。
+function drawHypsometricBasemap(
+  context: CanvasRenderingContext2D,
+  data: TerrainBlockData,
+  width: number,
+  height: number,
+  settings: SurfaceTextureSettings,
+) {
+  const rows = data.elevations.length;
+  const cols = data.elevations[0]?.length ?? 0;
+  if (rows < 2 || cols < 2) {
+    context.fillStyle = "#cfd8c2";
+    context.fillRect(0, 0, width, height);
+    return;
+  }
+  const small = document.createElement("canvas");
+  small.width = cols;
+  small.height = rows;
+  const sctx = small.getContext("2d");
+  if (!sctx) {
+    context.fillStyle = "#cfd8c2";
+    context.fillRect(0, 0, width, height);
+    return;
+  }
+  const img = sctx.createImageData(cols, rows);
+  const px = img.data;
+  const range = Math.max(data.maxElevation - data.minElevation, 1);
+  const lx = -0.707; // 光照来自左上
+  const ly = -0.707;
+  const elev = data.elevations;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const z = elev[r]?.[c] ?? data.minElevation;
+      const ratio = clamp((z - data.minElevation) / range, 0, 1);
+      let [cr, cg, cb] = hypsometricColor(ratio);
+      // 山体阴影：用相邻格高差求坡度与坡向
+      const zL = elev[r]?.[c - 1] ?? z;
+      const zR = elev[r]?.[c + 1] ?? z;
+      const zU = elev[r - 1]?.[c] ?? z;
+      const zD = elev[r + 1]?.[c] ?? z;
+      const dzdx = zR - zL;
+      const dzdy = zD - zU;
+      const slope = clamp((Math.hypot(dzdx, dzdy) / range) * 3.5, 0, 1);
+      const ga = Math.atan2(dzdy, dzdx);
+      const shade = clamp(1 + 0.7 * slope * (Math.cos(ga) * lx + Math.sin(ga) * ly), 0.5, 1.45);
+      cr *= shade;
+      cg *= shade;
+      cb *= shade;
+      // 沿用饱和度/对比度滑块
+      const luma = cr * 0.2126 + cg * 0.7152 + cb * 0.0722;
+      cr = luma + (cr - luma) * settings.saturation;
+      cg = luma + (cg - luma) * settings.saturation;
+      cb = luma + (cb - luma) * settings.saturation;
+      cr = (cr - 128) * settings.contrast + 128;
+      cg = (cg - 128) * settings.contrast + 128;
+      cb = (cb - 128) * settings.contrast + 128;
+      const i = (r * cols + c) * 4;
+      px[i] = clamp(cr, 0, 255);
+      px[i + 1] = clamp(cg, 0, 255);
+      px[i + 2] = clamp(cb, 0, 255);
+      px[i + 3] = 255;
+    }
+  }
+  sctx.putImageData(img, 0, 0);
+  // 双线性平滑放大，消除块状
+  context.save();
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(small, 0, 0, cols, rows, 0, 0, width, height);
+  context.restore();
+}
+
+// 沿计曲线放置高程标注：文字顺着等高线方向旋转，底下铺一小块底色形成"断白"，
+// 与地形图规范一致（计曲线标高程，标注处线条断开）。
+function labelContourRing(
+  context: CanvasRenderingContext2D,
+  ringPx: number[][],
+  value: number,
+  fontPx: number,
+  lineColor: string,
+  bgColor: string,
+  placed: number[][],
+  minDist: number,
+  spacing: number,
+) {
+  const n = ringPx.length;
+  if (n < 2) return;
+  const cum = [0];
+  let total = 0;
+  for (let i = 1; i < n; i++) {
+    total += Math.hypot(ringPx[i][0] - ringPx[i - 1][0], ringPx[i][1] - ringPx[i - 1][1]);
+    cum.push(total);
+  }
+  if (total < spacing * 0.6) return; // 线太短，不标注
+  const count = Math.max(1, Math.round(total / spacing));
+  const text = `${Math.round(value)}`;
+  for (let k = 0; k < count; k++) {
+    const target = (total * (k + 0.5)) / count;
+    let i = 1;
+    while (i < n && cum[i] < target) i++;
+    if (i >= n) i = n - 1;
+    const t = (target - cum[i - 1]) / Math.max(cum[i] - cum[i - 1], 1e-6);
+    const x = ringPx[i - 1][0] + (ringPx[i][0] - ringPx[i - 1][0]) * t;
+    const y = ringPx[i - 1][1] + (ringPx[i][1] - ringPx[i - 1][1]) * t;
+    if (placed.some((p) => Math.hypot(p[0] - x, p[1] - y) < minDist)) continue;
+    let ang = Math.atan2(ringPx[i][1] - ringPx[i - 1][1], ringPx[i][0] - ringPx[i - 1][0]);
+    if (ang > Math.PI / 2) ang -= Math.PI;
+    if (ang < -Math.PI / 2) ang += Math.PI;
+    context.save();
+    context.translate(x, y);
+    context.rotate(ang);
+    context.globalAlpha = 1;
+    context.font = `600 ${fontPx}px 'Inter', 'PingFang SC', sans-serif`;
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    // 背景透明：不画白色底板，改用细微描边保证在地形底图上可读
+    context.lineJoin = "round";
+    context.lineWidth = Math.max(2, fontPx * 0.16);
+    context.strokeStyle = bgColor;
+    context.strokeText(text, 0, 0);
+    context.fillStyle = lineColor;
+    context.fillText(text, 0, 0);
+    context.restore();
+    placed.push([x, y]);
+  }
+}
+
+function drawContourLines(
+  context: CanvasRenderingContext2D,
+  data: TerrainBlockData,
+  width: number,
+  height: number,
+  settings: SurfaceTextureSettings,
+) {
+  const elev = data.elevations;
+  if (!elev || elev.length < 2 || !elev[0] || elev[0].length < 2) return;
+  const rows = elev.length;
+  const cols = elev[0].length;
+  const minE = data.minElevation;
+  const maxE = data.maxElevation;
+  const span = maxE - minE;
+  if (!(span > 0)) return;
+
+  // 上采样 + 平滑，得到更密更圆滑的高程场
+  const grid = buildSmoothElevationField(elev, rows, cols, minE);
+
+  // 自动密度：随高差选取整数等高距（目标 ~30 条首曲线）
+  const step = chooseContourStep(span, 30);
+  const thresholds: number[] = [];
+  for (let t = Math.ceil(minE / step) * step; t < maxE; t += step) {
+    thresholds.push(t);
+  }
+  if (thresholds.length === 0) return;
+
+  let lines: Array<{ value: number; coordinates: number[][][][] }>;
+  try {
+    lines = contours().size([grid.w, grid.h]).smooth(true).thresholds(thresholds)(
+      grid.values,
+    ) as unknown as Array<{ value: number; coordinates: number[][][][] }>;
+  } catch {
+    return;
+  }
+
+  const sx = width / grid.w;
+  const sy = height / grid.h;
+
+  context.save();
+  context.lineJoin = "round";
+  context.lineCap = "round";
+  context.strokeStyle = settings.contourLineColor;
+
+  for (const line of lines) {
+    // 每 5 条画一根加粗"计曲线"，其余为普通"首曲线"
+    const isIndex = Math.round(line.value / step) % 5 === 0;
+    context.lineWidth = isIndex ? 1.8 : 0.85;
+    context.globalAlpha = isIndex ? 0.96 : 0.62;
+    context.beginPath();
+    for (const polygon of line.coordinates) {
+      for (const ring of polygon) {
+        strokeSmoothRing(context, ring, sx, sy);
+      }
+    }
+    context.stroke();
+  }
+
+  // 第二趟：在计曲线上标注海拔高程（每 5 条），字号受滑块控制
+  const fontPx = clamp(Math.min(width, height) / 42, 11, 26) * settings.contourLabelScale;
+  const spacing = Math.max(width, height) * 0.55;
+  const minDist = fontPx * 5;
+  const placed: number[][] = [];
+  for (const line of lines) {
+    if (Math.round(line.value / step) % 5 !== 0) continue;
+    for (const polygon of line.coordinates) {
+      for (const ring of polygon) {
+        const ringPx = ring.map((p) => [p[0] * sx, p[1] * sy]);
+        labelContourRing(
+          context,
+          ringPx,
+          line.value,
+          fontPx,
+          settings.contourLineColor,
+          "rgba(255,255,255,0.75)",
+          placed,
+          minDist,
+          spacing,
+        );
+      }
+    }
+  }
+
+  context.restore();
+}
+
 function renderSurfaceTexture(
   sourceTexture: THREE.Texture,
   maxAnisotropy: number,
   settings: SurfaceTextureSettings,
   data: TerrainBlockData,
+  contourBaseImage?: CanvasImageSource | null,
 ) {
   const image = sourceTexture.image as CanvasImageSource & {
     width?: number;
@@ -884,7 +1241,7 @@ function renderSurfaceTexture(
       pixels[index + 2] = clamp((blue - 128) * settings.contrast + 128, 0, 255);
     }
 
-    if (settings.renderMode !== "photo") {
+    if (settings.renderMode === "grid" || settings.renderMode === "hybrid") {
       for (let y = 0; y < height; y++) {
         for (let x = 0; x < width; x++) {
           const index = (y * width + x) * 4;
@@ -907,17 +1264,47 @@ function renderSurfaceTexture(
           if (settings.renderMode === "grid") {
             blendPixel(pixels, index, fillColor, 0.68);
             blendPixel(pixels, index, patchColor, patchAmount * 0.32);
-          } else {
+          } else if (settings.renderMode === "hybrid") {
             blendPixel(pixels, index, patchColor, patchAmount * 0.16);
           }
+          // contour 模式不做底色混合，保持卫星影像清晰，只叠等高线
         }
       }
     }
 
     context.putImageData(imageData, 0, 0);
-    if (settings.renderMode !== "photo") {
+    if (settings.renderMode === "contour") {
+      // 等高线底图：真实地图(Mapbox outdoors) 或 DEM 高程设色+山体阴影，再叠等高线 + OSM 水系
+      if (settings.contourBasemap === "map" && contourBaseImage) {
+        context.save();
+        context.imageSmoothingEnabled = true;
+        context.imageSmoothingQuality = "high";
+        context.drawImage(contourBaseImage, 0, 0, width, height);
+        // 轻微提亮，让等高线/标注更突出
+        context.globalAlpha = 0.16;
+        context.fillStyle = "#ffffff";
+        context.fillRect(0, 0, width, height);
+        context.restore();
+      } else {
+        drawHypsometricBasemap(context, data, width, height, settings);
+      }
+      drawContourLines(context, data, width, height, settings);
+      // 大型水体（如湖泊）：从卫星影像识别并按统一水体色填充。等高线底图没有卫星蓝打底，
+      // 故用更高的填充强度让水体清晰可见（颜色与其它模式一致）。
+      drawDetectedWaterOverlay(context, sourcePixels, width, height, settings.waterColor, settings.waterOpacity, 0.95);
+      drawWaterFeatures(context, data, width, height, settings.waterColor, settings.waterOpacity);
+    } else if (settings.renderMode !== "photo") {
       drawTerrainFacets(context, data, width, height, settings);
-      drawDetectedWaterOverlay(context, sourcePixels, width, height, settings.waterColor, settings.waterOpacity);
+      // 网格模式底图被网格填充色盖住、没有卫星蓝打底，水体用更高强度填充；混合模式仍叠在卫星上，保持轻。
+      drawDetectedWaterOverlay(
+        context,
+        sourcePixels,
+        width,
+        height,
+        settings.waterColor,
+        settings.waterOpacity,
+        settings.renderMode === "grid" ? 0.95 : 0.45,
+      );
       drawWaterFeatures(context, data, width, height, settings.waterColor, settings.waterOpacity);
     }
     const enhancedTexture = new THREE.CanvasTexture(canvas);
@@ -1109,6 +1496,11 @@ export default function TerrainBlock3D({ data }: TerrainBlock3DProps) {
   const gridLineColorRef = useRef(defaultGridLineColor);
   const gridFillColorRef = useRef(defaultGridFillColor);
   const gridPatchColorRef = useRef(defaultGridPatchColor);
+  const contourLineColorRef = useRef(defaultContourLineColor);
+  const contourLabelScaleRef = useRef(defaultContourLabelScale);
+  const contourBasemapRef = useRef<"hypso" | "map">(defaultContourBasemap);
+  const contourMapImageRef = useRef<HTMLImageElement | null>(null);
+  const contourMapKeyRef = useRef<string | null>(null);
   const waterColorRef = useRef(defaultWaterColor);
   const waterOpacityRef = useRef(defaultWaterOpacity);
   const facetSizeRef = useRef(defaultFacetSize);
@@ -1119,6 +1511,10 @@ export default function TerrainBlock3D({ data }: TerrainBlock3DProps) {
   const [gridLineColor, setGridLineColor] = useState(defaultGridLineColor);
   const [gridFillColor, setGridFillColor] = useState(defaultGridFillColor);
   const [gridPatchColor, setGridPatchColor] = useState(defaultGridPatchColor);
+  const [contourLineColor, setContourLineColor] = useState(defaultContourLineColor);
+  const [contourLabelScale, setContourLabelScale] = useState(defaultContourLabelScale);
+  const [contourBasemap, setContourBasemap] = useState<"hypso" | "map">(defaultContourBasemap);
+  const [contourMapVersion, setContourMapVersion] = useState(0);
   const [waterColor, setWaterColor] = useState(defaultWaterColor);
   const [waterOpacity, setWaterOpacity] = useState(defaultWaterOpacity);
   const [facetSize, setFacetSize] = useState(defaultFacetSize);
@@ -1150,7 +1546,13 @@ export default function TerrainBlock3D({ data }: TerrainBlock3DProps) {
     if (!surfaceMaterial || !sourceTexture) return;
 
     const previousTexture = enhancedSurfaceTextureRef.current;
-    const nextTexture = renderSurfaceTexture(sourceTexture, maxAnisotropyRef.current, settings, data);
+    const nextTexture = renderSurfaceTexture(
+      sourceTexture,
+      maxAnisotropyRef.current,
+      settings,
+      data,
+      contourMapImageRef.current,
+    );
     if (nextTexture === sourceTexture) {
       configureSurfaceTexture(sourceTexture, maxAnisotropyRef.current);
     }
@@ -1238,12 +1640,16 @@ export default function TerrainBlock3D({ data }: TerrainBlock3DProps) {
             gridLineColor: gridLineColorRef.current,
             gridFillColor: gridFillColorRef.current,
             gridPatchColor: gridPatchColorRef.current,
+            contourLineColor: contourLineColorRef.current,
+            contourLabelScale: contourLabelScaleRef.current,
+            contourBasemap: contourBasemapRef.current,
             waterColor: waterColorRef.current,
             waterOpacity: waterOpacityRef.current,
             facetSize: facetSizeRef.current,
             verticalExaggeration,
           },
           data,
+          contourMapImageRef.current,
         );
         surfaceMaterial.map = exportEnhancedTexture;
         surfaceMaterial.vertexColors = false;
@@ -1467,9 +1873,13 @@ export default function TerrainBlock3D({ data }: TerrainBlock3DProps) {
     gridLineColorRef.current = gridLineColor;
     gridFillColorRef.current = gridFillColor;
     gridPatchColorRef.current = gridPatchColor;
+    contourLineColorRef.current = contourLineColor;
+    contourLabelScaleRef.current = contourLabelScale;
+    contourBasemapRef.current = contourBasemap;
     waterColorRef.current = waterColor;
     waterOpacityRef.current = waterOpacity;
     facetSizeRef.current = facetSize;
+    void contourMapVersion; // 等高线真实地图加载完成后 bump，触发重渲染
     applySurfaceTextureSettings({
       contrast: surfaceContrast,
       saturation: surfaceSaturation,
@@ -1477,6 +1887,9 @@ export default function TerrainBlock3D({ data }: TerrainBlock3DProps) {
       gridLineColor,
       gridFillColor,
       gridPatchColor,
+      contourLineColor,
+      contourLabelScale,
+      contourBasemap,
       waterColor,
       waterOpacity,
       facetSize,
@@ -1484,6 +1897,10 @@ export default function TerrainBlock3D({ data }: TerrainBlock3DProps) {
     });
   }, [
     applySurfaceTextureSettings,
+    contourBasemap,
+    contourLabelScale,
+    contourLineColor,
+    contourMapVersion,
     facetSize,
     gridFillColor,
     gridLineColor,
@@ -1495,6 +1912,31 @@ export default function TerrainBlock3D({ data }: TerrainBlock3DProps) {
     waterColor,
     waterOpacity,
   ]);
+
+  // 等高线"真实地图"底图：按地块范围拉取 Mapbox outdoors 静态图（基于 OSM，CORS 安全）
+  useEffect(() => {
+    if (surfaceRenderMode !== "contour" || contourBasemap !== "map") return;
+    const token = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
+    if (!token) return;
+    const url = buildOutdoorsBasemapUrl(data.bounds, token);
+    if (contourMapKeyRef.current === url && contourMapImageRef.current) {
+      setContourMapVersion((v) => v + 1);
+      return;
+    }
+    let cancelled = false;
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      if (cancelled) return;
+      contourMapImageRef.current = img;
+      contourMapKeyRef.current = url;
+      setContourMapVersion((v) => v + 1);
+    };
+    img.src = url;
+    return () => {
+      cancelled = true;
+    };
+  }, [surfaceRenderMode, contourBasemap, data]);
 
   useEffect(() => {
     const surfaceMaterial = surfaceMaterialRef.current;
@@ -1536,6 +1978,9 @@ export default function TerrainBlock3D({ data }: TerrainBlock3DProps) {
           gridLineColor: gridLineColorRef.current,
           gridFillColor: gridFillColorRef.current,
           gridPatchColor: gridPatchColorRef.current,
+          contourLineColor: contourLineColorRef.current,
+          contourLabelScale: contourLabelScaleRef.current,
+          contourBasemap: contourBasemapRef.current,
           waterColor: waterColorRef.current,
           waterOpacity: waterOpacityRef.current,
           facetSize: facetSizeRef.current,
@@ -1586,30 +2031,47 @@ export default function TerrainBlock3D({ data }: TerrainBlock3DProps) {
             {surfaceTextureOptions.map((option) => (
               <button
                 key={option.id}
-                className={option.id === activeSurfaceTexture?.id ? styles.activeSurfaceTextureMode : ""}
+                className={
+                  option.id === activeSurfaceTexture?.id && surfaceRenderMode !== "contour"
+                    ? styles.activeSurfaceTextureMode
+                    : ""
+                }
                 type="button"
-                onClick={() => setActiveSurfaceTextureId(option.id)}
+                onClick={() => {
+                  setActiveSurfaceTextureId(option.id);
+                  // 从等高线切回影像来源时，恢复成卫星渲染
+                  if (surfaceRenderModeRef.current === "contour") setSurfaceRenderMode("photo");
+                }}
               >
                 {option.label}
               </button>
             ))}
+            <button
+              className={surfaceRenderMode === "contour" ? styles.activeSurfaceTextureMode : ""}
+              type="button"
+              onClick={() => setSurfaceRenderMode("contour")}
+            >
+              等高线
+            </button>
           </div>
-          <div className={styles.surfaceRenderModes} role="group" aria-label="顶面贴图样式">
-            {[
-              { value: "photo", label: "卫星" },
-              { value: "grid", label: "网格" },
-              { value: "hybrid", label: "混合" },
-            ].map((option) => (
-              <button
-                key={option.value}
-                className={surfaceRenderMode === option.value ? styles.activeSurfaceRenderMode : ""}
-                type="button"
-                onClick={() => setSurfaceRenderMode(option.value as SurfaceRenderMode)}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
+          {surfaceRenderMode !== "contour" && (
+            <div className={styles.surfaceRenderModes} role="group" aria-label="顶面贴图样式">
+              {[
+                { value: "photo", label: "卫星" },
+                { value: "grid", label: "网格" },
+                { value: "hybrid", label: "混合" },
+              ].map((option) => (
+                <button
+                  key={option.value}
+                  className={surfaceRenderMode === option.value ? styles.activeSurfaceRenderMode : ""}
+                  type="button"
+                  onClick={() => setSurfaceRenderMode(option.value as SurfaceRenderMode)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          )}
           <label>
             <span>对比度 {surfaceContrast.toFixed(2)}x</span>
             <input
@@ -1636,33 +2098,81 @@ export default function TerrainBlock3D({ data }: TerrainBlock3DProps) {
           </label>
           {surfaceRenderMode !== "photo" && (
             <div className={styles.surfaceColorControls}>
-              <label>
-                <span>线色</span>
-                <input
-                  aria-label="网格线色"
-                  type="color"
-                  value={gridLineColor}
-                  onChange={(event) => setGridLineColor(event.target.value)}
-                />
-              </label>
-              <label>
-                <span>底色</span>
-                <input
-                  aria-label="网格底色"
-                  type="color"
-                  value={gridFillColor}
-                  onChange={(event) => setGridFillColor(event.target.value)}
-                />
-              </label>
-              <label>
-                <span>块面</span>
-                <input
-                  aria-label="网格块面色"
-                  type="color"
-                  value={gridPatchColor}
-                  onChange={(event) => setGridPatchColor(event.target.value)}
-                />
-              </label>
+              {surfaceRenderMode === "contour" ? (
+                <>
+                  <label>
+                    <span>线色</span>
+                    <input
+                      aria-label="等高线颜色"
+                      type="color"
+                      value={contourLineColor}
+                      onChange={(event) => setContourLineColor(event.target.value)}
+                    />
+                  </label>
+                  <label className={styles.surfaceWaterStrength}>
+                    <span>高程字号 {contourLabelScale.toFixed(1)}x</span>
+                    <input
+                      aria-label="等高线高程标注字号"
+                      type="range"
+                      min="0.5"
+                      max="1.5"
+                      step="0.1"
+                      value={contourLabelScale}
+                      onChange={(event) => setContourLabelScale(Number(event.target.value))}
+                    />
+                  </label>
+                  <div
+                    className={styles.surfaceRenderModes}
+                    role="group"
+                    aria-label="等高线底图"
+                    style={{ gridColumn: "1 / -1" }}
+                  >
+                    {[
+                      { value: "hypso", label: "地形设色" },
+                      { value: "map", label: "真实地图" },
+                    ].map((option) => (
+                      <button
+                        key={option.value}
+                        className={contourBasemap === option.value ? styles.activeSurfaceRenderMode : ""}
+                        type="button"
+                        onClick={() => setContourBasemap(option.value as "hypso" | "map")}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <label>
+                    <span>线色</span>
+                    <input
+                      aria-label="网格线色"
+                      type="color"
+                      value={gridLineColor}
+                      onChange={(event) => setGridLineColor(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    <span>底色</span>
+                    <input
+                      aria-label="网格底色"
+                      type="color"
+                      value={gridFillColor}
+                      onChange={(event) => setGridFillColor(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    <span>块面</span>
+                    <input
+                      aria-label="网格块面色"
+                      type="color"
+                      value={gridPatchColor}
+                      onChange={(event) => setGridPatchColor(event.target.value)}
+                    />
+                  </label>
+                </>
+              )}
               <label>
                 <span>水体</span>
                 <input
@@ -1684,18 +2194,20 @@ export default function TerrainBlock3D({ data }: TerrainBlock3DProps) {
                   onChange={(event) => setWaterOpacity(Number(event.target.value))}
                 />
               </label>
-              <label className={styles.surfaceFacetSize}>
-                <span>面片大小 {facetSize.toFixed(0)}px</span>
-                <input
-                  aria-label="地形面片大小"
-                  type="range"
-                  min="8"
-                  max="42"
-                  step="1"
-                  value={facetSize}
-                  onChange={(event) => setFacetSize(Number(event.target.value))}
-                />
-              </label>
+              {surfaceRenderMode !== "contour" && (
+                <label className={styles.surfaceFacetSize}>
+                  <span>面片大小 {facetSize.toFixed(0)}px</span>
+                  <input
+                    aria-label="地形面片大小"
+                    type="range"
+                    min="8"
+                    max="42"
+                    step="1"
+                    value={facetSize}
+                    onChange={(event) => setFacetSize(Number(event.target.value))}
+                  />
+                </label>
+              )}
             </div>
           )}
         </div>
