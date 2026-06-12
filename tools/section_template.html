@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>长白山地区 1:20万地质图 · 天池剖面</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  body { margin:0; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#fafaf7; color:#333; }
+  header { padding:14px 24px 6px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .meta { font-size:12px; color:#888; }
+  #map { height:430px; margin:10px 16px; border:1px solid #ddd; border-radius:6px; }
+  #section-wrap { margin:6px 16px 8px; background:#fff; border:1px solid #ddd; border-radius:6px; padding:10px 6px 2px; overflow-x:auto; }
+  #legend { margin:0 16px 20px; font-size:12px; display:flex; flex-wrap:wrap; gap:6px 14px; }
+  .lg { display:flex; align-items:center; gap:5px; }
+  .sw { width:16px; height:11px; border:1px solid #999; display:inline-block; }
+  .leaflet-tooltip { font-size:12px; }
+  svg text { user-select:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>长白山地区地质图与天池火山剖面</h1>
+  <div class="meta">数据: 1:20万区域地质图空间数据库 K5214/K5215/K5220/K5221 · 地形: SRTM90 · 剖面 A–A′ 长 110 km · 垂直夸大 ≈14×</div>
+</header>
+<div id="map"></div>
+<div id="section-wrap"><svg id="section" width="1160" height="370"></svg></div>
+<div style="display:flex; gap:16px; margin:0 16px; align-items:flex-start;">
+  <div id="column-wrap" style="background:#fff;border:1px solid #ddd;border-radius:6px;padding:8px;">
+    <svg id="column" width="460" height="540"></svg>
+  </div>
+  <div id="legend" style="margin:0;"></div>
+</div>
+<div style="height:20px"></div>
+<script>
+const SEC = /*__SECTION__*/;
+const GEO = /*__GEOLOGY__*/;
+const FAULTS = /*__FAULTS__*/;
+
+// ---------- 配色 ----------
+const UNIT_COLORS = {
+  'βN2-Qp-1':'#7a8b5e','τQp-2':'#e2725b','τQh':'#f4c95d','τQ4':'#e8927c',
+  'τQ2':'#d95f43','βQ1':'#97a566','βN':'#5f7148','Q4-3':'#fdf3c0',
+};
+function colorOf(code, name){
+  if (UNIT_COLORS[code]) return UNIT_COLORS[code];
+  const c = code || '';
+  if (/^β/.test(c)) return '#85956b';
+  if (/^τ/.test(c)) return '#e09060';
+  if (/^γ/.test(c)) return '#e87a7a';
+  if (/^Qh|^Q4/.test(c)) return '#fdf6cf';
+  if (/^Q/.test(c))  return '#f7ec9e';
+  if (/^N/.test(c))  return '#ffd94a';
+  if (/^E/.test(c))  return '#fdb462';
+  if (/^K/.test(c))  return '#9ed27c';
+  if (/^J/.test(c))  return '#6fc8dc';
+  if (/^T/.test(c))  return '#b78cc1';
+  if (/^P/.test(c))  return '#f08a76';
+  if (/^C/.test(c))  return '#86b0a2';
+  if (/^D/.test(c))  return '#d2a35f';
+  if (/^S/.test(c))  return '#bfe3c0';
+  if (/^O/.test(c))  return '#54b08a';
+  if (/^ε|^Є/.test(c)) return '#7fbfa0';
+  if (/^Z|^Pt|^Ar/.test(c)) return '#f0a4b4';
+  let h=0; for (const ch of (code+name)) h=(h*31+ch.charCodeAt(0))>>>0;
+  return `hsl(${h%360},45%,72%)`;
+}
+
+// ---------- 地图 ----------
+const map = L.map('map').setView([41.97, 128.0], 9);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+  {opacity:0.45, attribution:'© OSM'}).addTo(map);
+L.geoJSON(GEO, {
+  style: ft => ({color:'#555', weight:0.4, fillColor:colorOf(ft.properties.DSO_TXT, ft.properties.DSN), fillOpacity:0.75}),
+  onEachFeature: (ft,l) => l.bindTooltip(`${ft.properties.DSN||''} ${ft.properties.DSO_TXT||''}`, {sticky:true})
+}).addTo(map);
+L.geoJSON(FAULTS, {style:{color:'#c0392b', weight:1.4}}).addTo(map);
+const AB = [[SEC.A[1],SEC.A[0]],[SEC.B[1],SEC.B[0]]];
+L.polyline(AB, {color:'#111', weight:2.5, dashArray:'8 5'}).addTo(map);
+L.marker(AB[0]).addTo(map).bindTooltip('A', {permanent:true, direction:'left'});
+L.marker(AB[1]).addTo(map).bindTooltip("A′", {permanent:true, direction:'right'});
+L.circleMarker([42.005,128.055],{radius:5,color:'#0066cc',fillOpacity:0.9}).addTo(map).bindTooltip('天池');
+
+// ---------- 剖面 ----------
+const svg = document.getElementById('section');
+const W=1160, H=370, mL=58, mR=18, mT=16, mB=44;
+const pw=W-mL-mR, ph=H-mT-mB;
+const E0=500, E1=2750;
+const X = t => mL + t*pw;
+const Y = e => mT + (1-(e-E0)/(E1-E0))*ph;
+const NS='http://www.w3.org/2000/svg';
+function el(n,a,parent){const e=document.createElementNS(NS,n);for(const k in a)e.setAttribute(k,a[k]);(parent||svg).appendChild(e);return e;}
+function elevAt(t){
+  const {ts,elev}=SEC;
+  if(t<=ts[0])return elev[0];
+  for(let i=1;i<ts.length;i++) if(t<=ts[i]){
+    const f=(t-ts[i-1])/(ts[i]-ts[i-1]); return elev[i-1]+f*(elev[i]-elev[i-1]);
+  }
+  return elev[elev.length-1];
+}
+// 网格
+for(let e=500;e<=2700;e+=500){
+  el('line',{x1:mL,x2:W-mR,y1:Y(e),y2:Y(e),stroke:'#eee'});
+  el('text',{x:mL-6,y:Y(e)+4,'text-anchor':'end','font-size':10,fill:'#999'},svg).textContent=e+' m';
+}
+for(let k=0;k<=110;k+=20){
+  const t=k/SEC.km;
+  el('line',{x1:X(t),x2:X(t),y1:mT,y2:mT+ph,stroke:'#f3f3f0'});
+  el('text',{x:X(t),y:H-mB+14,'text-anchor':'middle','font-size':10,fill:'#999'}).textContent=k+' km';
+}
+// 地质单元条带 (地形线以下着色, 底到 E0)
+const STEP=0.0015;
+for(const [t0,t1,name,code] of SEC.segs){
+  let d='M'+X(t0)+','+Y(elevAt(t0));
+  for(let t=t0;t<=t1+1e-9;t+=STEP){const tt=Math.min(t,t1); d+='L'+X(tt)+','+Y(elevAt(tt));}
+  d+='L'+X(t1)+','+(mT+ph)+'L'+X(t0)+','+(mT+ph)+'Z';
+  const p=el('path',{d,fill:colorOf(code,name),stroke:'none','fill-opacity':0.92});
+  const ti=el('title',{},p); ti.textContent=`${name} ${code}`;
+  el('line',{x1:X(t0),x2:X(t0),y1:Y(elevAt(t0)),y2:mT+ph,stroke:'#fff','stroke-width':0.8});
+}
+// 无数据区
+function gapRect(t0,t1,label){
+  el('rect',{x:X(t0),y:mT,width:X(t1)-X(t0),height:ph,fill:'url(#hatch)','fill-opacity':0.5});
+  if(label) el('text',{x:X((t0+t1)/2),y:mT+ph-8,'text-anchor':'middle','font-size':10,fill:'#777'}).textContent=label;
+}
+const defs=el('defs',{});
+const pat=el('pattern',{id:'hatch',width:6,height:6,patternUnits:'userSpaceOnUse',patternTransform:'rotate(45)'},defs);
+el('rect',{width:6,height:6,fill:'#f4f2ec'},pat);
+el('line',{x1:0,y1:0,x2:0,y2:6,stroke:'#ddd','stroke-width':2},pat);
+let cur=0;
+for(const [t0,t1] of SEC.segs.map(s=>[s[0],s[1]])){
+  if(t0-cur>0.006) gapRect(cur,t0, (cur>0.5&&cur<0.6)?'天池 / 境外无数据':'无数据');
+  cur=Math.max(cur,t1);
+}
+if(cur<0.994) gapRect(cur,1,'无数据');
+// 地形线
+let d='M';
+for(let i=0;i<SEC.ts.length;i++) d+=(i?'L':'')+X(SEC.ts[i])+','+Y(SEC.elev[i]);
+el('path',{d,fill:'none',stroke:'#3a3a3a','stroke-width':1.6});
+// 天池水面 (高程平段 2188m 自动定位)
+const li0=SEC.elev.indexOf(2188), li1=SEC.elev.lastIndexOf(2188);
+if(li0>=0){
+  const lt0=SEC.ts[li0], lt1=SEC.ts[li1];
+  el('line',{x1:X(lt0),x2:X(lt1),y1:Y(2189),y2:Y(2189),stroke:'#2980d9','stroke-width':2.5});
+  el('text',{x:X((lt0+lt1)/2),y:Y(2189)-30,'text-anchor':'middle','font-size':11,fill:'#2980d9','font-weight':'bold'}).textContent='天池 2189 m';
+}
+// 端点标注
+el('text',{x:mL,y:mT+10,'font-size':13,'font-weight':'bold'}).textContent='A (SW)';
+el('text',{x:W-mR,y:mT+10,'text-anchor':'end','font-size':13,'font-weight':'bold'}).textContent="A′ (NE)";
+// 单元标签 (宽度足够的分段)
+for(const [t0,t1,name,code] of SEC.segs){
+  if(t1-t0<0.035) continue;
+  const tm=(t0+t1)/2;
+  el('text',{x:X(tm),y:mT+ph-16,'text-anchor':'middle','font-size':11,fill:'#222'}).textContent=code;
+}
+// ---------- 综合岩层柱 (层序, 无厚度数据, 等高示意) ----------
+const csvg = document.getElementById('column');
+function cel(n,a,parent){const e=document.createElementNS(NS,n);for(const k in a)e.setAttribute(k,a[k]);(parent||csvg).appendChild(e);return e;}
+const cdefs = cel('defs',{});
+// 岩性花纹
+function mkPat(id, draw){
+  const p = cel('pattern',{id,width:14,height:14,patternUnits:'userSpaceOnUse'},cdefs);
+  draw(p); return p;
+}
+mkPat('p-bas', p=>{ // 玄武岩: V
+  cel('text',{x:3,y:10,'font-size':9,fill:'#00000055'},p).textContent='v';
+  cel('text',{x:9,y:6,'font-size':9,fill:'#00000044'},p).textContent='v';
+});
+mkPat('p-tra', p=>{ // 粗面岩: +
+  cel('path',{d:'M4,7h6M7,4v6',stroke:'#00000055','stroke-width':1,fill:'none'},p);
+});
+mkPat('p-ash', p=>{ // 火山灰: 三角点
+  cel('path',{d:'M3,9l3-4l3,4z',stroke:'#00000055',fill:'none','stroke-width':0.8},p);
+});
+mkPat('p-sed', p=>{ // 松散沉积: 点
+  cel('circle',{cx:4,cy:4,r:1,fill:'#00000066'},p);
+  cel('circle',{cx:10,cy:10,r:1,fill:'#00000066'},p);
+});
+cel('text',{x:12,y:20,'font-size':13,'font-weight':'bold'}).textContent='综合岩层柱 (剖面单元, 新→老)';
+cel('text',{x:12,y:36,'font-size':10,fill:'#888'}).textContent='注: 本区图幅厚度字段缺失, 柱高为层序示意; 年龄为属性表同位素年龄原值 (ka)';
+const CX=88, CW=130, CT=52, CB=12;
+const rh = (540-CT-CB)/SEC.units.length;
+SEC.units.forEach((u,i)=>{
+  const y=CT+i*rh;
+  cel('rect',{x:CX,y,width:CW,height:rh,fill:colorOf(u.code,u.name),stroke:'#444','stroke-width':1});
+  cel('rect',{x:CX,y,width:CW,height:rh,fill:`url(#p-${u.lith})`,stroke:'none'});
+  // 不整合/喷发间断: 波浪线 (火山岩之间统一用波浪接触示意)
+  if(i>0){
+    let d='M'+CX+','+y; for(let x=0;x<CW;x+=10) d+=`q5,-3 10,0`;
+    cel('path',{d,fill:'none',stroke:'#333','stroke-width':1});
+  }
+  cel('text',{x:CX-8,y:y+rh/2-4,'text-anchor':'end','font-size':10,fill:'#666'}).textContent=u.epoch;
+  cel('text',{x:CX+CW/2,y:y+rh/2+4,'text-anchor':'middle','font-size':12,'font-weight':'bold',fill:'#1a1a1a'}).textContent=u.code;
+  cel('text',{x:CX+CW+10,y:y+rh/2-2,'font-size':12}).textContent=u.name;
+  cel('text',{x:CX+CW+10,y:y+rh/2+13,'font-size':10,fill:'#777'}).textContent=u.age?('年龄: '+u.age):'年龄: —';
+});
+// ---------- 图例 ----------
+const lgDiv=document.getElementById('legend');
+const seen=new Map();
+for(const [,,name,code] of SEC.segs) if(!seen.has(code)) seen.set(code,name);
+lgDiv.innerHTML='<b style="width:100%">剖面单元:</b>'+[...seen].map(([c,n]) =>
+  `<span class="lg"><span class="sw" style="background:${colorOf(c,n)}"></span>${n} (${c})</span>`).join('');
+</script>
+</body>
+</html>
